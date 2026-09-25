@@ -1,4 +1,5 @@
 #include "bactro/MotionBlur.hpp"
+#include "bactro/PhaseHud.hpp"
 #include "bactro/Status.hpp"
 
 #include <pl/ModMenu.hpp>
@@ -411,9 +412,13 @@ void processFrame() {
 }
 
 EGLBoolean swapDetour(EGLDisplay dpy, EGLSurface surface) {
-    // Apply blur on the completed frame, then present
+    // Apply blur on the completed frame, then Phase HUD overlay, then present
     try {
         processFrame();
+    } catch (...) {
+    }
+    try {
+        bactro::phasehud::onFrame();
     } catch (...) {
     }
     return g_swapOriginal ? g_swapOriginal(dpy, surface) : EGL_FALSE;

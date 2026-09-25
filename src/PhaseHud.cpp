@@ -74,7 +74,7 @@ EglSwapBuffersFn g_swapOriginal = nullptr;
 
 void* (*p_eglGetProcAddress)(const char*) = nullptr;
 GLuint (*p_glCreateShader)(GLenum) = nullptr;
-void (*p_glShaderSource)(GLuint, GLsizei, const GLchar**, const GLint*) = nullptr;
+void (*p_glShaderSource)(GLuint, GLsizei, const GLchar* const*, const GLint*) = nullptr;
 void (*p_glCompileShader)(GLuint) = nullptr;
 void (*p_glGetShaderiv)(GLuint, GLenum, GLint*) = nullptr;
 void (*p_glGetShaderInfoLog)(GLuint, GLsizei, GLsizei*, GLchar*) = nullptr;
@@ -88,7 +88,7 @@ void (*p_glUseProgram)(GLuint) = nullptr;
 GLint (*p_glGetAttribLocation)(GLuint, const GLchar*) = nullptr;
 void (*p_glGenBuffers)(GLsizei, GLuint*) = nullptr;
 void (*p_glBindBuffer)(GLenum, GLuint) = nullptr;
-void (*p_glBufferData)(GLenum, long, const void*, GLenum) = nullptr;
+void (*p_glBufferData)(GLenum, GLsizei, const void*, GLenum) = nullptr;
 void (*p_glEnableVertexAttribArray)(GLuint) = nullptr;
 void (*p_glVertexAttribPointer)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*) = nullptr;
 void (*p_glDrawArrays)(GLenum, GLint, GLsizei) = nullptr;
@@ -108,13 +108,16 @@ void logLine(const char* fmt, ...) {
 }
 
 void* loadProc(const char* name) {
-    void* p = nullptr;
-    if (p_eglGetProcAddress) p = p_eglGetProcAddress(name);
-    if (!p) {
-        void* lib = dlopen("libGLESv2.so", RTLD_NOW);
-        if (lib) p = dlsym(lib, name);
+    // Prefer eglGetProcAddress (same as MotionBlur)
+    void* p = reinterpret_cast<void*>(eglGetProcAddress(name));
+    if (p) return p;
+    if (p_eglGetProcAddress) {
+        p = p_eglGetProcAddress(name);
+        if (p) return p;
     }
-    return p;
+    void* lib = dlopen("libGLESv2.so", RTLD_NOW);
+    if (!lib) lib = dlopen("libGLESv3.so", RTLD_NOW);
+    return lib ? dlsym(lib, name) : nullptr;
 }
 
 bool loadGl() {
