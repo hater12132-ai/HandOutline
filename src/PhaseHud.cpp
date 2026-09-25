@@ -53,8 +53,8 @@ namespace {
 constexpr const char* kModuleId = "bactro.phasehud";
 
 std::atomic_bool g_enabled{true};
-std::atomic<float> g_scale{0.22f};
-std::atomic<float> g_y{-0.72f};
+std::atomic<float> g_scale{0.28f};
+std::atomic<float> g_y{-0.55f};
 std::atomic<float> g_opacity{0.95f};
 
 std::mutex g_mu;
@@ -351,28 +351,7 @@ EGLBoolean swapDetour(EGLDisplay dpy, EGLSurface surf) {
 }
 
 void tryHook() {
-    if (g_hooked) return;
-    void* egl = dlopen("libEGL.so", RTLD_NOW);
-    void* swap = nullptr;
-    if (egl) {
-        p_eglGetProcAddress =
-            reinterpret_cast<decltype(p_eglGetProcAddress)>(dlsym(egl, "eglGetProcAddress"));
-        if (p_eglGetProcAddress) swap = p_eglGetProcAddress("eglSwapBuffers");
-        if (!swap) swap = dlsym(egl, "eglSwapBuffers");
-    }
-    if (!swap) {
-        logLine("PhaseHud: eglSwapBuffers not found");
-        return;
-    }
-    void* o = nullptr;
-    pl::memory::hook(swap, reinterpret_cast<void*>(&swapDetour), &o);
-    if (o) {
-        g_swapOriginal = reinterpret_cast<EglSwapBuffersFn>(o);
-        g_hooked = true;
-        logLine("PhaseHud: eglSwapBuffers hooked");
-    } else {
-        logLine("PhaseHud: hook FAILED");
-    }
+    // disabled — MotionBlur owns eglSwapBuffers
 }
 
 void onToggle(std::string_view, bool en) {
@@ -405,7 +384,13 @@ void registerModule() {
     b.registerModule();
 }
 
-void onSignaturesReady() { tryHook(); }
+void onSignaturesReady() {
+    logLine("PhaseHud: ready (draw via MotionBlur onFrame only)");
+}
+
+void onFrame() {
+    drawHud();
+}
 
 void shutdown() { g_enabled.store(false, std::memory_order_release); }
 
