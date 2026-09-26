@@ -19,25 +19,23 @@
 namespace bactro::handchams {
 namespace {
 
-// Bedrock Color { r, g, b, a } — must outlive the call if the engine stores the pointer
 struct Color {
     float r, g, b, a;
 };
 
 constexpr const char* kModuleId = "bactro.handchams";
 
-std::atomic_bool g_enabled{false};
-std::atomic<float> g_r{1.00f};
-std::atomic<float> g_g{1.00f};
+std::atomic_bool g_enabled{false}; // off until after join (safe)
+std::atomic_bool g_handOnly{false}; // false = hand + visible players (no wallhack)
+std::atomic<float> g_r{0.20f};
+std::atomic<float> g_g{0.90f};
 std::atomic<float> g_b{1.00f};
-std::atomic<float> g_fill{1.0f};
-std::atomic<float> g_glow{0.25f};
+std::atomic<float> g_intensity{1.0f}; // fill strength
 std::atomic_int g_hits{0};
 std::atomic_int g_enters{0};
 
-// Persistent storage so pointers passed into the game stay valid
-Color g_fillColor{0.15f, 0.85f, 1.0f, 1.0f};
-Color g_overlayColor{1.0f, 1.0f, 1.05f, 0.2f};
+// Persistent — engine may keep pointers past the call
+Color g_chamsColor{0.20f, 0.90f, 1.00f, 1.0f};
 
 void logLine(const char* fmt, ...) {
     char buf[192];
@@ -49,38 +47,37 @@ void logLine(const char* fmt, ...) {
     HC_LOGI("%s", buf);
 }
 
-void refreshColors() {
-    const float f = g_fill.load(std::memory_order_relaxed);
-    g_fillColor = {
-        g_r.load(std::memory_order_relaxed) * f,
-        g_g.load(std::memory_order_relaxed) * f,
-        g_b.load(std::memory_order_relaxed) * f,
+void refreshColor() {
+    const float i = g_intensity.load(std::memory_order_relaxed);
+    g_chamsColor = {
+        g_r.load(std::memory_order_relaxed) * i,
+        g_g.load(std::memory_order_relaxed) * i,
+        g_b.load(std::memory_order_relaxed) * i,
         1.0f,
-    };
-    // Very thin white rim — low alpha; RGB sliders tint the outline
-    const float glow = g_glow.load(std::memory_order_relaxed);
-    g_overlayColor = {
-        g_r.load(std::memory_order_relaxed),
-        g_g.load(std::memory_order_relaxed),
-        g_b.load(std::memory_order_relaxed),
-        0.02f + glow * 0.22f,  // thin
     };
 }
 
-// ---- renderFirstPerson: mark FP hand only (no color logic here) ----
+bool shouldApply() {
+    if (!g_enabled.load(std::memory_order_relaxed)) return false;
+    if (g_handOnly.load(std::memory_order_relaxed))
+        return bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
+    // Visible models only: we never disable depth → no wallhack
+    return true;
+}
+
+// ---- FP hand marker ----
 using RenderFirstPersonFn = void (*)(void*, void*, void*, void*, void*, void*);
 RenderFirstPersonFn g_renderFpOriginal = nullptr;
 bool g_renderFpHooked = false;
 
 void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5) {
     if (!g_renderFpOriginal) return;
-    // Always forward first — never skip the real render (crash-safe)
     bactro::phase::inFirstPersonHand.store(true, std::memory_order_release);
     g_renderFpOriginal(self, a1, a2, a3, a4, a5);
     bactro::phase::inFirstPersonHand.store(false, std::memory_order_release);
 }
 
-// ---- setEntityConstants ----
+// ---- setEntityConstants: solid chams fill ----
 using SetEntityConstantsFn = void (*)(
     void*, void*, const Color*, const void*, const void*, const Color*, const Color*, const Color*,
     const Color*, const void*, const void*, float, float, float, float);
@@ -96,31 +93,30 @@ void setEntityConstantsDetour(
     if (!g_setEntityConstants) return;
 
     const int enter = g_enters.fetch_add(1, std::memory_order_relaxed);
-    if (enter < 12)
-        logLine("HandChams: setEntityConstants ENTER #%d en=%d", enter, g_enabled.load() ? 1 : 0);
+    if (enter < 8)
+        logLine("HandChams: ENTER #%d en=%d apply=%d", enter, g_enabled.load() ? 1 : 0,
+                shouldApply() ? 1 : 0);
 
-    // Hand / held item only — never other players / world entities
-    const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
-    if (!g_enabled.load(std::memory_order_relaxed) || !fp) {
+    if (!shouldApply()) {
         g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
                              overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
                              uvOffset2, uvRot1, uvRot2);
         return;
     }
 
-    // Thin outline only: keep original changeColor (real item colors).
-    // Soft white overlay = outer glow/rim, NOT solid fill.
-    refreshColors();
+    refreshColor();
+    // Solid chams: changeColor + overlay both set to configured color (BedrockTools-style)
     g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
-                         &g_overlayColor, changeColor, changeColor2, glintColor, glintUVScale, uvAnim,
+                         &g_chamsColor, &g_chamsColor, &g_chamsColor, glintColor, glintUVScale, uvAnim,
                          uvOffset1, uvOffset2, uvRot1, uvRot2);
 
     const int n = g_hits.fetch_add(1, std::memory_order_relaxed);
-    if (n < 12)
-        logLine("HandChams: outline inject #%d glowA=%.2f", n, g_overlayColor.a);
+    if (n < 10)
+        logLine("HandChams: chams #%d rgb=%.2f,%.2f,%.2f fp=%d", n, g_chamsColor.r, g_chamsColor.g,
+                g_chamsColor.b, bactro::phase::inFirstPersonHand.load() ? 1 : 0);
 }
 
-// ---- ActorGlint (enchanted) — same static colors ----
+// ---- enchanted / glint path ----
 using SetupActorGlintFn = void (*)(
     void*, void*, void*, const Color*, const Color*, const Color*, const Color*, float, float, float, float,
     const void*);
@@ -134,16 +130,14 @@ void setupActorGlintDetour(
     float uvRot2, const void* lightEmissionColor) {
     if (!g_setupActorGlint) return;
 
-    const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
-    if (!g_enabled.load(std::memory_order_relaxed) || !fp) {
+    if (!shouldApply()) {
         g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
                           uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
         return;
     }
 
-    refreshColors();
-    // Outline only — keep real changeColor / item look
-    g_setupActorGlint(screenContext, entityContext, actor, &g_overlayColor, changeColor, changeColor2,
+    refreshColor();
+    g_setupActorGlint(screenContext, entityContext, actor, &g_chamsColor, &g_chamsColor, &g_chamsColor,
                       glintColor, uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
 }
 
@@ -159,7 +153,7 @@ void tryInstallHooks() {
             g_renderFpHooked = true;
             logLine("HandChams: renderFirstPerson hooked");
         } else {
-            logLine("HandChams: renderFirstPerson FAIL (skip)");
+            logLine("HandChams: renderFirstPerson FAIL");
         }
     }
 
@@ -172,7 +166,7 @@ void tryInstallHooks() {
             g_hookedEntity = true;
             logLine("HandChams: setEntityConstants hooked");
         } else {
-            logLine("HandChams: setEntityConstants FAIL (skip)");
+            logLine("HandChams: setEntityConstants FAIL");
         }
     }
 
@@ -185,7 +179,7 @@ void tryInstallHooks() {
             g_hookedActor = true;
             logLine("HandChams: setupActorGlint hooked");
         } else {
-            logLine("HandChams: setupActorGlint FAIL (skip)");
+            logLine("HandChams: setupActorGlint FAIL");
         }
     }
 
@@ -196,10 +190,7 @@ void tryInstallHooks() {
 void onToggle(std::string_view, bool enabled) {
     g_enabled.store(enabled, std::memory_order_release);
     logLine("HandChams %s", enabled ? "ON" : "OFF");
-    if (enabled) {
-        // Install only when user turns it on — avoids crash on world join
-        tryInstallHooks();
-    }
+    if (enabled) tryInstallHooks();
 }
 
 void onConfig(std::string_view, std::string_view key, std::string_view value) {
@@ -210,11 +201,11 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_g.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "b")
             g_b.store(std::stof(std::string(value)), std::memory_order_relaxed);
-        else if (key == "fill")
-            g_fill.store(std::stof(std::string(value)), std::memory_order_relaxed);
-        else if (key == "glow")
-            g_glow.store(std::stof(std::string(value)), std::memory_order_relaxed);
-        refreshColors();
+        else if (key == "intensity")
+            g_intensity.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        else if (key == "handOnly")
+            g_handOnly.store(value == "true" || value == "1", std::memory_order_relaxed);
+        refreshColor();
     } catch (...) {
     }
 }
@@ -224,20 +215,23 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Hand Chams");
     b.description(
-         "Visible-model color tint (hand + players). No wallhack. RGB + glow. "
-         "If the game crashes, turn this module OFF.")
+         "Solid chams on hand, held items, and visible players. "
+         "No wallhack (depth stays on). RGB like BedrockTools. "
+         "Join world first, then enable.")
         .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
-    b.config("r", "Outline Red", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
-    b.config("g", "Outline Green", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
-    b.config("b", "Outline Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
-    b.config("glow", "Outline thickness", pl::modmenu::ConfigType::SliderFloat, "0.25", "0", "1", "");
+    b.config("r", "Red", pl::modmenu::ConfigType::SliderFloat, "0.20", "0", "1", "");
+    b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "0.90", "0", "1", "");
+    b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
+    b.config("intensity", "Intensity", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.1", "2.0", "");
+    b.config("handOnly", "Hand only (off = players too)", pl::modmenu::ConfigType::Toggle, "false", "", "",
+             "");
     b.registerModule();
 }
 
 void onSignaturesReady() {
-    logLine("HandChams: ready (enable module to install color hooks)");
+    logLine("HandChams: ready — enable module after you join the world");
 }
 
 void shutdown() { g_enabled.store(false, std::memory_order_release); }
