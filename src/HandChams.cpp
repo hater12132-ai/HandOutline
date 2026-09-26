@@ -27,11 +27,11 @@ struct Color {
 constexpr const char* kModuleId = "bactro.handchams";
 
 std::atomic_bool g_enabled{false};
-std::atomic<float> g_r{0.15f};
-std::atomic<float> g_g{0.85f};
+std::atomic<float> g_r{1.00f};
+std::atomic<float> g_g{1.00f};
 std::atomic<float> g_b{1.00f};
 std::atomic<float> g_fill{1.0f};
-std::atomic<float> g_glow{0.35f};
+std::atomic<float> g_glow{0.25f};
 std::atomic_int g_hits{0};
 std::atomic_int g_enters{0};
 
@@ -57,8 +57,14 @@ void refreshColors() {
         g_b.load(std::memory_order_relaxed) * f,
         1.0f,
     };
+    // Very thin white rim — low alpha; RGB sliders tint the outline
     const float glow = g_glow.load(std::memory_order_relaxed);
-    g_overlayColor = {1.0f, 1.0f, 1.05f, 0.05f + glow * 0.45f};
+    g_overlayColor = {
+        g_r.load(std::memory_order_relaxed),
+        g_g.load(std::memory_order_relaxed),
+        g_b.load(std::memory_order_relaxed),
+        0.02f + glow * 0.22f,  // thin
+    };
 }
 
 // ---- renderFirstPerson: mark FP hand only (no color logic here) ----
@@ -93,22 +99,25 @@ void setEntityConstantsDetour(
     if (enter < 12)
         logLine("HandChams: setEntityConstants ENTER #%d en=%d", enter, g_enabled.load() ? 1 : 0);
 
-    if (!g_enabled.load(std::memory_order_relaxed)) {
+    // Hand / held item only — never other players / world entities
+    const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
+    if (!g_enabled.load(std::memory_order_relaxed) || !fp) {
         g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
                              overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
                              uvOffset2, uvRot1, uvRot2);
         return;
     }
 
-    // Static storage — do NOT pass stack addresses
+    // Thin outline only: keep original changeColor (real item colors).
+    // Soft white overlay = outer glow/rim, NOT solid fill.
     refreshColors();
     g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
-                         &g_overlayColor, &g_fillColor, &g_fillColor, glintColor, glintUVScale, uvAnim,
+                         &g_overlayColor, changeColor, changeColor2, glintColor, glintUVScale, uvAnim,
                          uvOffset1, uvOffset2, uvRot1, uvRot2);
 
     const int n = g_hits.fetch_add(1, std::memory_order_relaxed);
     if (n < 12)
-        logLine("HandChams: inject #%d rgb=%.2f,%.2f,%.2f", n, g_fillColor.r, g_fillColor.g, g_fillColor.b);
+        logLine("HandChams: outline inject #%d glowA=%.2f", n, g_overlayColor.a);
 }
 
 // ---- ActorGlint (enchanted) — same static colors ----
@@ -125,14 +134,16 @@ void setupActorGlintDetour(
     float uvRot2, const void* lightEmissionColor) {
     if (!g_setupActorGlint) return;
 
-    if (!g_enabled.load(std::memory_order_relaxed)) {
+    const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
+    if (!g_enabled.load(std::memory_order_relaxed) || !fp) {
         g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
                           uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
         return;
     }
 
     refreshColors();
-    g_setupActorGlint(screenContext, entityContext, actor, &g_overlayColor, &g_fillColor, &g_fillColor,
+    // Outline only — keep real changeColor / item look
+    g_setupActorGlint(screenContext, entityContext, actor, &g_overlayColor, changeColor, changeColor2,
                       glintColor, uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
 }
 
@@ -218,11 +229,10 @@ void registerModule() {
         .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
-    b.config("r", "Red", pl::modmenu::ConfigType::SliderFloat, "0.15", "0", "1", "");
-    b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "0.85", "0", "1", "");
-    b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
-    b.config("fill", "Fill strength", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.1", "1.5", "");
-    b.config("glow", "Outer glow", pl::modmenu::ConfigType::SliderFloat, "0.35", "0", "1", "");
+    b.config("r", "Outline Red", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
+    b.config("g", "Outline Green", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
+    b.config("b", "Outline Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
+    b.config("glow", "Outline thickness", pl::modmenu::ConfigType::SliderFloat, "0.25", "0", "1", "");
     b.registerModule();
 }
 
