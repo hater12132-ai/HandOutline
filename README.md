@@ -22,3 +22,17 @@ Without material.bin redirect:
 
 ## TargetHUD / HealthCache
 Intentionally removed. Do not restore from old zips.
+
+## Wire Outline RE (1.26.51.01_RC0)
+
+From `libminecraftpe.so` analysis:
+
+- ECS: `AABBShapeComponent` { Vec3 min, Vec3 max, float width, float height }
+- ECS: `StateVectorComponent` { Vec3 pos, posPrev, posDelta }
+- Camera: `CameraAPI` / `CameraAPIComponent` / `CameraClientInstanceComponent`
+- Symbols resolved via existing signatures: ActorIsPlayer, HitResultGetEntity,
+  LevelGetHitResult, ActorFetchNearbyActorsSorted, ClientInstanceGetLocalPlayer
+
+3D white wire = world AABB corners projected with view-projection, then GL_LINES.
+Component access + camera matrix still required before safe draw (no 2D HUD cards).
+
