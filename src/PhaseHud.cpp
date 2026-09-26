@@ -52,7 +52,7 @@ namespace {
 
 constexpr const char* kModuleId = "bactro.phasehud";
 
-std::atomic_bool g_enabled{true};
+std::atomic_bool g_enabled{false};
 std::atomic<float> g_scale{0.18f};
 std::atomic<float> g_x{0.62f};
 std::atomic<float> g_y{-0.48f};

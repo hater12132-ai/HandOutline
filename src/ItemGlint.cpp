@@ -26,7 +26,7 @@ struct Color {
 
 constexpr const char* kModuleId = "bactro.itemglint";
 
-std::atomic_bool g_enabled{true};
+std::atomic_bool g_enabled{false};
 std::atomic_bool g_handOnly{true};  // 1.6.3: only first-person held item
 // Pure white outline/glint (user request). Opacity scales the effect.
 std::atomic<float> g_opacity{1.0f};

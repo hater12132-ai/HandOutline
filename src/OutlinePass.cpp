@@ -26,7 +26,7 @@ struct Color {
 
 constexpr const char* kModuleId = "bactro.outline";
 
-std::atomic_bool g_enabled{true};
+std::atomic_bool g_enabled{false};
 std::atomic_bool g_handOnly{false}; // false = try all entity glint/overlay paths
 std::atomic<float> g_intensity{1.25f};
 std::atomic<float> g_alpha{0.85f};

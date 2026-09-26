@@ -44,9 +44,10 @@ void logLine(const char* fmt, ...) {
     HC_LOGI("%s", buf);
 }
 
+// Visible-model chams only: we never disable depth / never draw hidden geometry.
+// Coloring runs on normal engine draws → hand + players you can already see.
 bool wantChams() {
-    return g_enabled.load(std::memory_order_relaxed) &&
-           bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
+    return g_enabled.load(std::memory_order_relaxed);
 }
 
 Color makeFill() {
@@ -95,15 +96,16 @@ void setEntityConstantsDetour(
 
     if (wantChams()) {
         const Color fill = makeFill();
-        const Color glow = makeGlowOverlay();
-        // changeColor ≈ solid dye/chams fill; overlay ≈ soft outer glow
+        // Solid-ish fill via changeColor; soft white outer via overlay (glow slider)
+        const float glow = g_glow.load(std::memory_order_relaxed);
+        const Color overlay = {1.0f, 1.0f, 1.05f, 0.05f + glow * 0.45f};
         g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
-                             &glow, &fill, &fill, glintColor, glintUVScale, uvAnim, uvOffset1, uvOffset2, uvRot1,
-                             uvRot2);
+                             &overlay, &fill, &fill, glintColor, glintUVScale, uvAnim, uvOffset1, uvOffset2,
+                             uvRot1, uvRot2);
         const int n = g_hits.fetch_add(1, std::memory_order_relaxed);
-        if (n < 6)
-            logLine("HandChams: inject #%d rgb=%.2f,%.2f,%.2f glow=%.2f", n, fill.r, fill.g, fill.b,
-                    g_glow.load());
+        if (n < 12)
+            logLine("HandChams: inject #%d rgb=%.2f,%.2f,%.2f glow=%.2f fp=%d", n, fill.r, fill.g, fill.b,
+                    glow, bactro::phase::inFirstPersonHand.load() ? 1 : 0);
         return;
     }
 
@@ -128,8 +130,9 @@ void setupActorGlintDetour(
 
     if (wantChams()) {
         const Color fill = makeFill();
-        const Color glow = makeGlowOverlay();
-        g_setupActorGlint(screenContext, entityContext, actor, &glow, &fill, &fill, glintColor, uvOffset1,
+        const float glow = g_glow.load(std::memory_order_relaxed);
+        const Color overlay = {1.0f, 1.0f, 1.05f, 0.05f + glow * 0.45f};
+        g_setupActorGlint(screenContext, entityContext, actor, &overlay, &fill, &fill, glintColor, uvOffset1,
                           uvOffset2, uvRot1, uvRot2, lightEmissionColor);
         return;
     }
