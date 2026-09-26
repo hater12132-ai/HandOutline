@@ -229,7 +229,7 @@ void registerModule() {
          "1.6.3: white foil/glint on FIRST-PERSON held items only (enchanted path). "
          "Not Actions&Stuff geometry outline — engine has no item silhouette pass. "
          "Turn off Hand Only to apply everywhere foil is drawn.")
-        .defaultEnabled(true)
+        .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
     b.config("opacity", "Glint opacity", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.2", "1", "");

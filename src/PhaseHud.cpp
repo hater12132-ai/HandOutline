@@ -53,8 +53,9 @@ namespace {
 constexpr const char* kModuleId = "bactro.phasehud";
 
 std::atomic_bool g_enabled{true};
-std::atomic<float> g_scale{0.28f};
-std::atomic<float> g_y{-0.55f};
+std::atomic<float> g_scale{0.18f};
+std::atomic<float> g_x{0.62f};
+std::atomic<float> g_y{-0.48f};
 std::atomic<float> g_opacity{0.95f};
 
 std::mutex g_mu;
@@ -188,12 +189,12 @@ bool compileShader(GLenum type, const char* src, GLuint& out) {
     return ok != 0;
 }
 
-void buildGeometry(float scale, float y, float opacity) {
+void buildGeometry(float scale, float x, float y, float opacity) {
     // Interleaved pos.xy + color.rgba — 6 floats per vertex
     // Fill: triangle fan center + 5 verts
     GLfloat fill[7 * 6];
-    // center — deep navy
-    fill[0] = 0.f;
+    // center — deep navy (screen position over FP hand)
+    fill[0] = x;
     fill[1] = y;
     fill[2] = 0.06f;
     fill[3] = 0.10f;
@@ -204,12 +205,13 @@ void buildGeometry(float scale, float y, float opacity) {
         float px = std::cos(ang) * scale;
         float py = std::sin(ang) * scale * 1.15f; // slight vertical stretch
         int o = (i + 1) * 6;
-        fill[o + 0] = px;
+        fill[o + 0] = x + px;
         fill[o + 1] = y + py;
-        // outer verts slightly brighter blue for depth
-        fill[o + 2] = 0.10f;
-        fill[o + 3] = 0.14f;
-        fill[o + 4] = 0.42f;
+        // outer verts — galaxy blue with star-ish variation
+        float star = (i % 2 == 0) ? 0.35f : 0.15f;
+        fill[o + 2] = 0.08f + star * 0.15f;
+        fill[o + 3] = 0.12f + star * 0.20f;
+        fill[o + 4] = 0.38f + star * 0.45f;
         fill[o + 5] = opacity;
     }
     // close fan
@@ -227,7 +229,7 @@ void buildGeometry(float scale, float y, float opacity) {
         float px = std::cos(ang) * scale * 1.04f;
         float py = std::sin(ang) * scale * 1.15f * 1.04f;
         int o = i * 6;
-        border[o + 0] = px;
+        border[o + 0] = x + px;
         border[o + 1] = y + py;
         border[o + 2] = 1.0f;
         border[o + 3] = 1.0f;
@@ -299,9 +301,10 @@ void drawHud() {
     if (!initGl()) return;
 
     const float scale = g_scale.load(std::memory_order_relaxed);
+    const float x = g_x.load(std::memory_order_relaxed);
     const float y = g_y.load(std::memory_order_relaxed);
     const float op = g_opacity.load(std::memory_order_relaxed);
-    buildGeometry(scale, y, op);
+    buildGeometry(scale, x, y, op);
 
     p_glDisable(GL_DEPTH_TEST);
     p_glDisable(GL_CULL_FACE);
@@ -339,7 +342,7 @@ void drawHud() {
     p_glDrawArrays(GL_LINE_LOOP, 0, 5);
 
     if (g_drawLog < 5) {
-        logLine("PhaseHud: draw #%d scale=%.2f y=%.2f", g_drawLog, scale, y);
+        logLine("PhaseHud: draw #%d scale=%.2f x=%.2f y=%.2f", g_drawLog, scale, x, y);
         ++g_drawLog;
     }
 }
@@ -362,6 +365,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
     try {
         if (key == "scale")
             g_scale.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        else if (key == "x")
+            g_x.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "y")
             g_y.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "opacity")
@@ -375,10 +380,11 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Phase HUD");
     b.description("2D Phase-style navy pentagon + white border (bottom). Pure visual overlay.")
-        .defaultEnabled(true)
+        .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
-    b.config("scale", "Card size", pl::modmenu::ConfigType::SliderFloat, "0.22", "0.10", "0.45", "");
+    b.config("scale", "Card size", pl::modmenu::ConfigType::SliderFloat, "0.18", "0.08", "0.40", "");
+    b.config("x", "Horizontal (hand side)", pl::modmenu::ConfigType::SliderFloat, "0.62", "0.20", "0.90", "");
     b.config("y", "Vertical (NDC)", pl::modmenu::ConfigType::SliderFloat, "-0.72", "-0.95", "-0.20", "");
     b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.95", "0.3", "1.0", "");
     b.registerModule();

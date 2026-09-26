@@ -222,7 +222,7 @@ void registerModule() {
          "Native second-pass outline: dual first-person render + white overlay inject on entity "
          "shader constants. Closest to Phase silhouette without scaling the mesh (scale needs "
          "model-matrix access). Turn Hand Only OFF for paper-doll / third-person.")
-        .defaultEnabled(true)
+        .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
     b.config("intensity", "Outline intensity", pl::modmenu::ConfigType::SliderFloat, "1.25", "0.3", "3", "");

@@ -4,6 +4,7 @@
 #include "bactro/ItemGlint.hpp"
 #include "bactro/OutlinePass.hpp"
 #include "bactro/PhaseHud.hpp"
+#include "bactro/HandChams.hpp"
 #include "bactro/Status.hpp"
 #include "Version.hpp"
 
@@ -190,6 +191,7 @@ void resolveEverythingAsync() {
         bactro::motionblur::onSignaturesReady();
         bactro::itemglint::onSignaturesReady();
         bactro::outline::onSignaturesReady();
+        bactro::handchams::onSignaturesReady();
         bactro::phasehud::onSignaturesReady();
         writeStatus("async init finished");
     }).detach();
@@ -248,6 +250,7 @@ void registerMenus() {
     bactro::motionblur::registerModule();
     bactro::itemglint::registerModule();
     bactro::outline::registerModule();
+    bactro::handchams::registerModule();
     bactro::phasehud::registerModule();
 }
 
@@ -287,6 +290,7 @@ public:
         bactro::itemglint::shutdown();
         bactro::outline::shutdown();
         bactro::phasehud::shutdown();
+        bactro::handchams::shutdown();
         return true;
     }
 
@@ -297,6 +301,7 @@ public:
         bactro::itemglint::shutdown();
         bactro::outline::shutdown();
         bactro::phasehud::shutdown();
+        bactro::handchams::shutdown();
         return true;
     }
 };
