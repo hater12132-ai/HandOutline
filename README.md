@@ -36,3 +36,12 @@ From `libminecraftpe.so` analysis:
 3D white wire = world AABB corners projected with view-projection, then GL_LINES.
 Component access + camera matrix still required before safe draw (no 2D HUD cards).
 
+
+## Camera matrix RE notes (1.26.51.01_RC0) — in progress
+
+- Shader uniforms: `u_viewProj`, `u_prevViewProj`, `u_modelViewProj`, `u_invViewProj`
+- Registration table @ file/VA `0x1c85158` → name `u_viewProj`
+- BSS UniformHandle slot @ VA `0x131b3d18` (filled at runtime, zeros in file)
+- GLES imports `glUniformMatrix4fv` — capture path for VP when matrix is uploaded
+- Still need: absolute-address hook for `glUniformMatrix4fv` (or PLT), nearby-actor ABI, stable StateVector via entt
+

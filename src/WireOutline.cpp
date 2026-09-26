@@ -32,25 +32,30 @@ std::atomic_bool g_armor{true};
 std::atomic_bool g_players{true};
 std::atomic_bool g_crystals{true};
 std::atomic_bool g_draw3d{true};
+std::atomic_bool g_outlineSelf{true};
 std::atomic<float> g_lineWidth{2.0f};
 
 using ActorIsPlayerFn = bool (*)(void*);
-using HitResultGetEntityFn = void* (*)(void*);
 ActorIsPlayerFn g_isPlayer = nullptr;
-HitResultGetEntityFn g_hitGetEntity = nullptr;
-std::uintptr_t g_levelGetHitResult = 0;
-std::uintptr_t g_fetchNearby = 0;
-std::uintptr_t g_clientGetLocalPlayer = 0;
+void* g_localPlayer = nullptr;
+void* g_clientInstance = nullptr;
+using GetLocalPlayerFn = void* (*)(void*);
+GetLocalPlayerFn g_getLocalPlayer = nullptr;
+void* g_clientInstance = nullptr;
 
-void* g_localPlayer = nullptr; // set from NormalTick when isPlayer
-std::mutex g_boxMu;
+std::mutex g_vpMu;
+float g_viewProj[16]{};
+std::atomic_bool g_vpValid{false};
+std::atomic_int g_vpHits{0};
+
 struct Box {
     float minx, miny, minz, maxx, maxy, maxz;
 };
-std::vector<Box> g_boxes; // world-space AABBs to draw this frame
+std::mutex g_boxMu;
+std::vector<Box> g_boxes;
 
 void logLine(const char* fmt, ...) {
-    char buf[220];
+    char buf[240];
     va_list ap;
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -63,58 +68,114 @@ bool finite3(float x, float y, float z) {
     return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
 }
 
-// Reasonable overworld-ish coords for 1.26
 bool looksLikeWorldPos(float x, float y, float z) {
     if (!finite3(x, y, z)) return false;
     if (std::fabs(x) > 300000.f || std::fabs(z) > 300000.f) return false;
     if (y < -80.f || y > 400.f) return false;
-    // reject near-zero junk
     if (std::fabs(x) < 1e-3f && std::fabs(y) < 1e-3f && std::fabs(z) < 1e-3f) return false;
     return true;
 }
 
-bool looksLikeAABB(float minx, float miny, float minz, float maxx, float maxy, float maxz) {
-    if (!finite3(minx, miny, minz) || !finite3(maxx, maxy, maxz)) return false;
-    if (maxx <= minx || maxy <= miny || maxz <= minz) return false;
-    const float dx = maxx - minx, dy = maxy - miny, dz = maxz - minz;
-    if (dx < 0.05f || dy < 0.05f || dz < 0.05f) return false;
-    if (dx > 8.f || dy > 12.f || dz > 8.f) return false; // entity-sized
-    if (!looksLikeWorldPos((minx + maxx) * 0.5f, (miny + maxy) * 0.5f, (minz + maxz) * 0.5f))
-        return false;
-    return true;
+bool looksLikeViewProj(const float* m) {
+    if (!m) return false;
+    for (int i = 0; i < 16; ++i)
+        if (!std::isfinite(m[i])) return false;
+    bool id = true;
+    for (int i = 0; i < 16; ++i) {
+        float expect = (i % 5 == 0) ? 1.f : 0.f;
+        if (std::fabs(m[i] - expect) > 1e-4f) {
+            id = false;
+            break;
+        }
+    }
+    if (id) return false;
+    return (std::fabs(m[11]) + std::fabs(m[14]) + std::fabs(m[15] - 1.f)) > 0.05f;
 }
 
-// ---- Probe Actor memory for AABBShapeComponent-like data (min,max or pos+size) ----
-// Public SDK: AABBShape { Vec3 min, Vec3 max, float w, float h } @ ~0x20
-// StateVector { Vec3 pos, prev, delta } @ ~0x24
-// We only ACCEPT values that pass looksLike* — never invent.
 bool probeActorBox(void* actor, Box& out) {
     if (!actor) return false;
     auto* base = reinterpret_cast<unsigned char*>(actor);
-
-    // Try a small set of offsets used by various 1.20–1.21 dumps (validated by looksLike only)
     static const int kPosOff[] = {0x48, 0x50, 0x68, 0x70, 0x88, 0x90, 0xA0, 0xB0, 0xC8, 0xD0,
                                   0x100, 0x108, 0x120, 0x128, 0x148, 0x150, 0x168, 0x190,
-                                  0x1A0, 0x1C0, 0x1E0, 0x200, 0x220, 0x240, 0x280, 0x2A0};
+                                  0x1A0, 0x1C0, 0x1E0, 0x200, 0x220, 0x240, 0x280, 0x2A0,
+                                  0x2C0, 0x300, 0x340, 0x380, 0x3C0, 0x400};
     for (int off : kPosOff) {
         auto* f = reinterpret_cast<float*>(base + off);
-        // Pattern A: AABB min/max (6 floats)
-        if (looksLikeAABB(f[0], f[1], f[2], f[3], f[4], f[5])) {
-            out = {f[0], f[1], f[2], f[3], f[4], f[5]};
-            return true;
+        if (finite3(f[0], f[1], f[2]) && finite3(f[3], f[4], f[5])) {
+            float dx = f[3] - f[0], dy = f[4] - f[1], dz = f[5] - f[2];
+            if (dx > 0.05f && dy > 0.05f && dz > 0.05f && dx < 8.f && dy < 12.f && dz < 8.f) {
+                float cx = (f[0] + f[3]) * 0.5f, cy = (f[1] + f[4]) * 0.5f, cz = (f[2] + f[5]) * 0.5f;
+                if (looksLikeWorldPos(cx, cy, cz)) {
+                    out = {f[0], f[1], f[2], f[3], f[4], f[5]};
+                    return true;
+                }
+            }
         }
-        // Pattern B: pos + default player size (0.6 x 1.8 x 0.6)
         if (looksLikeWorldPos(f[0], f[1], f[2])) {
-            const float x = f[0], y = f[1], z = f[2];
-            const float hw = 0.3f, h = 1.8f;
-            out = {x - hw, y, z - hw, x + hw, y + h, z + hw};
+            float x = f[0], y = f[1], z = f[2];
+            out = {x - 0.3f, y, z - 0.3f, x + 0.3f, y + 1.8f, z + 0.3f};
             return true;
         }
     }
     return false;
 }
 
-// ---- NormalTick: capture local player ----
+// ---- glUniformMatrix4fv (absolute hook via pl::memory::hook, same as eglSwapBuffers) ----
+using PFN_glUniformMatrix4fv = void (*)(int, int, unsigned char, const float*);
+PFN_glUniformMatrix4fv g_glUniformMatrix4fvOrig = nullptr;
+std::atomic_bool g_glHooked{false};
+
+void glUniformMatrix4fvDetour(int location, int count, unsigned char transpose, const float* value) {
+    if (value && count >= 1 && looksLikeViewProj(value)) {
+        {
+            std::lock_guard<std::mutex> lock(g_vpMu);
+            if (transpose) {
+                for (int r = 0; r < 4; ++r)
+                    for (int c = 0; c < 4; ++c)
+                        g_viewProj[c * 4 + r] = value[r * 4 + c];
+            } else {
+                std::memcpy(g_viewProj, value, 16 * sizeof(float));
+            }
+        }
+        g_vpValid.store(true, std::memory_order_release);
+        int n = g_vpHits.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8)
+            logLine("WireOutline: VP captured loc=%d (#%d)", location, n);
+    }
+    if (g_glUniformMatrix4fvOrig)
+        g_glUniformMatrix4fvOrig(location, count, transpose, value);
+}
+
+void* resolveGlUniformMatrix4fv() {
+    if (void* p = reinterpret_cast<void*>(eglGetProcAddress("glUniformMatrix4fv")))
+        return p;
+    void* h = dlopen("libGLESv2.so", RTLD_NOW);
+    if (!h) h = dlopen("libGLESv3.so", RTLD_NOW);
+    if (!h) h = dlopen("libGLESv2.so", RTLD_NOW);
+    return h ? dlsym(h, "glUniformMatrix4fv") : nullptr;
+}
+
+bool installGlHook() {
+    if (g_glHooked.load(std::memory_order_acquire)) return true;
+    void* target = resolveGlUniformMatrix4fv();
+    if (!target) {
+        logLine("WireOutline: glUniformMatrix4fv not found");
+        return false;
+    }
+    logLine("WireOutline: glUniformMatrix4fv @%p", target);
+    void* o = nullptr;
+    // Same absolute-address hook MotionBlur uses for eglSwapBuffers (0 = success)
+    if (pl::memory::hook(target, reinterpret_cast<void*>(&glUniformMatrix4fvDetour), &o) == 0 && o) {
+        g_glUniformMatrix4fvOrig = reinterpret_cast<PFN_glUniformMatrix4fv>(o);
+        g_glHooked.store(true, std::memory_order_release);
+        logLine("WireOutline: glUniformMatrix4fv HOOKED (VP capture active)");
+        return true;
+    }
+    logLine("WireOutline: glUniformMatrix4fv hook FAIL");
+    return false;
+}
+
+// ---- NormalTick: local player ----
 using NormalTickFn = void (*)(void*);
 NormalTickFn g_tickOriginal = nullptr;
 bool g_tickHooked = false;
@@ -133,7 +194,6 @@ void normalTickDetour(void* self) {
     }
 }
 
-// ---- FP hand marker ----
 using RenderFirstPersonFn = void (*)(void*, void*, void*, void*, void*, void*);
 RenderFirstPersonFn g_renderFpOriginal = nullptr;
 bool g_fpHooked = false;
@@ -146,29 +206,25 @@ void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4,
     if (want) bactro::phase::inFirstPersonHand.store(false, std::memory_order_release);
 }
 
-// Collect boxes once per frame from local player + hit entity
 void collectBoxes() {
     std::vector<Box> next;
-    void* lp = g_localPlayer;
-    if (lp && g_players.load(std::memory_order_relaxed)) {
-        // don't outline self by default — skip local; other players need nearby list
-        (void)lp;
+    if (g_outlineSelf.load(std::memory_order_relaxed) && g_localPlayer) {
+        Box b{};
+        if (probeActorBox(g_localPlayer, b)) {
+            next.push_back(b);
+            static int once = 0;
+            if (once < 3) {
+                logLine("WireOutline: self AABB (%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f)", b.minx, b.miny, b.minz,
+                        b.maxx, b.maxy, b.maxz);
+                ++once;
+            }
+        }
     }
-
-    // Hit-result entity (whatever you're looking at)
-    // LevelGetHitResult needs Level* — without ClientInstance->level we skip call.
-    // Instead: if we previously stored hit entity another way, use probe.
-
-    // Probe local player only for debug box (optional): proves probe works in-world
-    // Disabled for self to avoid messy self-outline; enable via players+debug later.
-
-    {
-        std::lock_guard<std::mutex> lock(g_boxMu);
-        g_boxes.swap(next);
-    }
+    std::lock_guard<std::mutex> lock(g_boxMu);
+    g_boxes.swap(next);
 }
 
-// ---- GLES line renderer (NDC after CPU project) ----
+// ---- GLES lines ----
 using GLenum = unsigned int;
 using GLuint = unsigned int;
 using GLint = int;
@@ -187,7 +243,6 @@ constexpr GLenum GL_SRC_ALPHA = 0x0302;
 constexpr GLenum GL_ONE_MINUS_SRC_ALPHA = 0x0303;
 constexpr GLenum GL_DEPTH_TEST = 0x0B71;
 
-using PFN_void = void (*)();
 void* glProc(const char* name) {
     if (void* p = reinterpret_cast<void*>(eglGetProcAddress(name))) return p;
     void* h = dlopen("libGLESv2.so", RTLD_NOW);
@@ -195,7 +250,7 @@ void* glProc(const char* name) {
     return h ? dlsym(h, name) : nullptr;
 }
 
-#define GLDECL(ret, name, ...)           \
+#define GLDECL(ret, name, ...) \
     using PFN_##name = ret (*)(__VA_ARGS__); \
     PFN_##name p_##name = nullptr
 
@@ -235,34 +290,14 @@ bool loadGl() {
     if (g_glReady) return g_prog != 0;
     g_glReady = true;
 #define L(n) p_##n = reinterpret_cast<PFN_##n>(glProc(#n))
-    L(glCreateShader);
-    L(glShaderSource);
-    L(glCompileShader);
-    L(glGetShaderiv);
-    L(glCreateProgram);
-    L(glAttachShader);
-    L(glLinkProgram);
-    L(glGetProgramiv);
-    L(glUseProgram);
-    L(glGetAttribLocation);
-    L(glGetUniformLocation);
-    L(glUniform4f);
-    L(glGenBuffers);
-    L(glBindBuffer);
-    L(glBufferData);
-    L(glEnableVertexAttribArray);
-    L(glVertexAttribPointer);
-    L(glDrawArrays);
-    L(glEnable);
-    L(glDisable);
-    L(glBlendFunc);
-    L(glLineWidth);
-    L(glDeleteShader);
+    L(glCreateShader); L(glShaderSource); L(glCompileShader); L(glGetShaderiv);
+    L(glCreateProgram); L(glAttachShader); L(glLinkProgram); L(glGetProgramiv);
+    L(glUseProgram); L(glGetAttribLocation); L(glGetUniformLocation); L(glUniform4f);
+    L(glGenBuffers); L(glBindBuffer); L(glBufferData);
+    L(glEnableVertexAttribArray); L(glVertexAttribPointer); L(glDrawArrays);
+    L(glEnable); L(glDisable); L(glBlendFunc); L(glLineWidth); L(glDeleteShader);
 #undef L
-    if (!p_glCreateShader || !p_glDrawArrays) {
-        logLine("WireOutline: GLES load FAIL");
-        return false;
-    }
+    if (!p_glCreateShader) return false;
     const char* vs = "attribute vec2 aPos; void main(){ gl_Position=vec4(aPos,0.0,1.0); }";
     const char* fs = "precision mediump float; uniform vec4 uColor; void main(){ gl_FragColor=uColor; }";
     auto compile = [](GLenum t, const char* s) -> GLuint {
@@ -275,10 +310,7 @@ bool loadGl() {
     };
     GLuint v = compile(GL_VERTEX_SHADER, vs);
     GLuint f = compile(GL_FRAGMENT_SHADER, fs);
-    if (!v || !f) {
-        logLine("WireOutline: shader compile FAIL");
-        return false;
-    }
+    if (!v || !f) return false;
     g_prog = p_glCreateProgram();
     p_glAttachShader(g_prog, v);
     p_glAttachShader(g_prog, f);
@@ -289,33 +321,81 @@ bool loadGl() {
     p_glDeleteShader(f);
     if (!linked) {
         g_prog = 0;
-        logLine("WireOutline: shader link FAIL");
         return false;
     }
     g_aPos = p_glGetAttribLocation(g_prog, "aPos");
     g_uColor = p_glGetUniformLocation(g_prog, "uColor");
     p_glGenBuffers(1, &g_vbo);
-    logLine("WireOutline: GLES lines ready");
+    logLine("WireOutline: GLES line program OK");
     return true;
 }
 
-// Simple perspective from local player-ish camera (yaw/pitch unknown → use identity view).
-// Until real CameraAPI matrix is found we only project if we also have local player pos
-// and treat camera at local feet+1.6 looking +Z — WRONG for real play.
-// So: **do not draw** until we have a better matrix. This function stays ready.
+bool worldToNdc(const float vp[16], float x, float y, float z, float& ox, float& oy) {
+    float clipX = vp[0] * x + vp[4] * y + vp[8] * z + vp[12];
+    float clipY = vp[1] * x + vp[5] * y + vp[9] * z + vp[13];
+    float clipW = vp[3] * x + vp[7] * y + vp[11] * z + vp[15];
+    if (std::fabs(clipW) < 1e-5f) return false;
+    ox = clipX / clipW;
+    oy = clipY / clipW;
+    return std::isfinite(ox) && std::isfinite(oy) && ox > -2.f && ox < 2.f && oy > -2.f && oy < 2.f;
+}
+
 void projectAndDraw(const std::vector<Box>& boxes) {
-    if (boxes.empty()) return;
-    if (!g_draw3d.load(std::memory_order_relaxed)) return;
+    if (boxes.empty() || !g_draw3d.load(std::memory_order_relaxed)) return;
+    if (!g_vpValid.load(std::memory_order_acquire)) {
+        if (g_drawLog < 5) {
+            logLine("WireOutline: boxes=%d waiting VP (glHook=%d)", (int)boxes.size(),
+                    g_glHooked.load() ? 1 : 0);
+            ++g_drawLog;
+        }
+        return;
+    }
+    float vp[16];
+    {
+        std::lock_guard<std::mutex> lock(g_vpMu);
+        std::memcpy(vp, g_viewProj, sizeof(vp));
+    }
+    std::vector<float> lines;
+    for (const auto& b : boxes) {
+        float c[8][3] = {
+            {b.minx, b.miny, b.minz}, {b.maxx, b.miny, b.minz}, {b.maxx, b.maxy, b.minz}, {b.minx, b.maxy, b.minz},
+            {b.minx, b.miny, b.maxz}, {b.maxx, b.miny, b.maxz}, {b.maxx, b.maxy, b.maxz}, {b.minx, b.maxy, b.maxz},
+        };
+        float s[8][2];
+        bool ok[8];
+        for (int i = 0; i < 8; ++i)
+            ok[i] = worldToNdc(vp, c[i][0], c[i][1], c[i][2], s[i][0], s[i][1]);
+        const int edges[12][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6},
+                                  {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+        for (auto& e : edges)
+            if (ok[e[0]] && ok[e[1]]) {
+                lines.push_back(s[e[0]][0]);
+                lines.push_back(s[e[0]][1]);
+                lines.push_back(s[e[1]][0]);
+                lines.push_back(s[e[1]][1]);
+            }
+    }
+    if (lines.empty()) return;
+
     std::lock_guard<std::mutex> lock(g_glMu);
     if (!loadGl() || !g_prog) return;
-
-    // Without camera matrix, skip draw (prevents wrong boxes / crashes).
-    // Status once:
-    if (g_drawLog < 3) {
-        logLine("WireOutline: have %d boxes but camera matrix not locked — no draw", (int)boxes.size());
+    p_glDisable(GL_DEPTH_TEST);
+    p_glEnable(GL_BLEND);
+    p_glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    if (p_glLineWidth) p_glLineWidth(g_lineWidth.load());
+    p_glUseProgram(g_prog);
+    if (p_glUniform4f && g_uColor >= 0)
+        p_glUniform4f(g_uColor, 1.f, 1.f, 1.f, 0.95f);
+    p_glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    p_glBufferData(GL_ARRAY_BUFFER, (long)(lines.size() * sizeof(float)), lines.data(), 0x88E4);
+    p_glEnableVertexAttribArray((GLuint)g_aPos);
+    p_glVertexAttribPointer((GLuint)g_aPos, 2, GL_FLOAT, 0, 0, nullptr);
+    p_glDrawArrays(GL_LINES, 0, (GLsizei)(lines.size() / 2));
+    p_glUseProgram(0);
+    if (g_drawLog < 12) {
+        logLine("WireOutline: drew %d segs", (int)(lines.size() / 4));
         ++g_drawLog;
     }
-    (void)boxes;
 }
 
 void resolveAndHook() {
@@ -326,30 +406,6 @@ void resolveAndHook() {
             logLine("WireOutline: ActorIsPlayer @%p", reinterpret_cast<void*>(a));
         }
     }
-    if (!g_hitGetEntity) {
-        auto a = bactro::memory::resolve(bactro::memory::SignatureId::HitResultGetEntity);
-        if (a) {
-            g_hitGetEntity = reinterpret_cast<HitResultGetEntityFn>(a);
-            logLine("WireOutline: HitResultGetEntity @%p", reinterpret_cast<void*>(a));
-        }
-    }
-    if (!g_levelGetHitResult) {
-        g_levelGetHitResult = bactro::memory::resolve(bactro::memory::SignatureId::LevelGetHitResult);
-        if (g_levelGetHitResult)
-            logLine("WireOutline: LevelGetHitResult @%p", reinterpret_cast<void*>(g_levelGetHitResult));
-    }
-    if (!g_fetchNearby) {
-        g_fetchNearby = bactro::memory::resolve(bactro::memory::SignatureId::ActorFetchNearbyActorsSorted);
-        if (g_fetchNearby)
-            logLine("WireOutline: FetchNearby @%p", reinterpret_cast<void*>(g_fetchNearby));
-    }
-    if (!g_clientGetLocalPlayer) {
-        g_clientGetLocalPlayer =
-            bactro::memory::resolve(bactro::memory::SignatureId::ClientInstanceGetLocalPlayer);
-        if (g_clientGetLocalPlayer)
-            logLine("WireOutline: GetLocalPlayer @%p", reinterpret_cast<void*>(g_clientGetLocalPlayer));
-    }
-
     if (!g_tickHooked) {
         void* o = nullptr;
         if (bactro::memory::hook(bactro::memory::SignatureId::NormalTick,
@@ -357,11 +413,10 @@ void resolveAndHook() {
             o) {
             g_tickOriginal = reinterpret_cast<NormalTickFn>(o);
             g_tickHooked = true;
-            logLine("WireOutline: NormalTick hooked (local player capture)");
+            logLine("WireOutline: NormalTick hooked");
         } else
             logLine("WireOutline: NormalTick FAIL");
     }
-
     if (!g_fpHooked) {
         void* o = nullptr;
         if (bactro::memory::hook(bactro::memory::SignatureId::ItemInHandRendererRenderFirstPerson,
@@ -369,15 +424,19 @@ void resolveAndHook() {
             o) {
             g_renderFpOriginal = reinterpret_cast<RenderFirstPersonFn>(o);
             g_fpHooked = true;
-            logLine("WireOutline: renderFirstPerson hooked (hand/items path)");
-        } else
-            logLine("WireOutline: renderFirstPerson FAIL");
+            logLine("WireOutline: renderFirstPerson hooked");
+        }
     }
-
-    logLine("WireOutline: targets hand=%d armor=%d players=%d crystals=%d", g_handItems.load() ? 1 : 0,
-            g_armor.load() ? 1 : 0, g_players.load() ? 1 : 0, g_crystals.load() ? 1 : 0);
-    logLine("WireOutline: hooks tick=%d fp=%d | next: camera matrix + nearby actors", g_tickHooked ? 1 : 0,
-            g_fpHooked ? 1 : 0);
+    if (!g_getLocalPlayer) {
+        auto a = bactro::memory::resolve(bactro::memory::SignatureId::ClientInstanceGetLocalPlayer);
+        if (a) {
+            g_getLocalPlayer = reinterpret_cast<GetLocalPlayerFn>(a);
+            logLine("WireOutline: GetLocalPlayer @%p", reinterpret_cast<void*>(a));
+        }
+    }
+    installGlHook();
+    logLine("WireOutline: tick=%d fp=%d glHook=%d vp=%d getLP=%d", g_tickHooked ? 1 : 0, g_fpHooked ? 1 : 0,
+            g_glHooked.load() ? 1 : 0, g_vpValid.load() ? 1 : 0, g_getLocalPlayer ? 1 : 0);
 }
 
 void onToggle(std::string_view, bool enabled) {
@@ -398,6 +457,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_crystals.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "draw3d")
             g_draw3d.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "outlineSelf")
+            g_outlineSelf.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "lineWidth")
             g_lineWidth.store(std::stof(std::string(value)), std::memory_order_relaxed);
     } catch (...) {
@@ -409,9 +470,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Wire Outline");
     b.description(
-         "White wire on hand/items/weapons, armor, players, crystals.\n"
-         "1.26.51: local player capture + GLES ready.\n"
-         "Camera matrix still required before lines appear (no fake 2D box).")
+         "White 3D AABB wire. VP from glUniformMatrix4fv (same hook style as MotionBlur). "
+         "Self-outline for debug (F5). Players/crystals next once nearby ABI is locked.")
         .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
@@ -419,20 +479,24 @@ void registerModule() {
     b.config("armor", "Armor", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("players", "Players", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("crystals", "Crystals", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
-    b.config("draw3d", "3D draw when ready", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("outlineSelf", "Outline self (F5 debug)", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("draw3d", "3D draw", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("lineWidth", "Line width", pl::modmenu::ConfigType::SliderFloat, "2.0", "1", "5", "");
     b.registerModule();
 }
 
-void onSignaturesReady() { logLine("WireOutline: ready — enable after join"); }
+void onSignaturesReady() { logLine("WireOutline: ready"); }
 
 void shutdown() {
     g_enabled.store(false, std::memory_order_release);
     g_localPlayer = nullptr;
+    g_vpValid.store(false, std::memory_order_release);
 }
 
 void onPostFrame() {
     if (!g_enabled.load(std::memory_order_relaxed)) return;
+    if (!g_glHooked.load(std::memory_order_acquire))
+        installGlHook();
     collectBoxes();
     std::vector<Box> copy;
     {
