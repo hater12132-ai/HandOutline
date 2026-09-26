@@ -41,7 +41,6 @@ void* g_localPlayer = nullptr;
 void* g_clientInstance = nullptr;
 using GetLocalPlayerFn = void* (*)(void*);
 GetLocalPlayerFn g_getLocalPlayer = nullptr;
-void* g_clientInstance = nullptr;
 
 std::mutex g_vpMu;
 float g_viewProj[16]{};
