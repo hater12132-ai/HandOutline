@@ -1,9 +1,5 @@
 #include "bactro/Signatures.hpp"
-#include "bactro/HandShader.hpp"
 #include "bactro/MotionBlur.hpp"
-#include "bactro/ItemGlint.hpp"
-#include "bactro/OutlinePass.hpp"
-#include "bactro/PhaseHud.hpp"
 #include "bactro/HandChams.hpp"
 #include "bactro/Status.hpp"
 #include "Version.hpp"
@@ -119,7 +115,6 @@ void normalTickDetour(void* self) {
             else eglSwapInterval(d, 0);
         }
     }
-    bactro::handshader::onFrame();
 }
 
 bool installSwapIntervalHook() {
@@ -187,13 +182,9 @@ void resolveEverythingAsync() {
         }
 
         installTickHook();
-        bactro::handshader::onSignaturesReady();
-        bactro::motionblur::onSignaturesReady();
-        bactro::itemglint::onSignaturesReady();
-        bactro::outline::onSignaturesReady();
-        bactro::handchams::onSignaturesReady();
-        bactro::phasehud::onSignaturesReady();
-        writeStatus("async init finished");
+                bactro::motionblur::onSignaturesReady();
+                        bactro::handchams::onSignaturesReady();
+                writeStatus("async init finished");
     }).detach();
 }
 
@@ -246,12 +237,8 @@ void registerMenus() {
         b.config("fullbright", "Fullbright", pl::modmenu::ConfigType::SliderFloat, "0", "0", "10", "");
         b.registerModule();
     }
-    bactro::handshader::registerModule();
     bactro::motionblur::registerModule();
-    bactro::itemglint::registerModule();
-    bactro::outline::registerModule();
     bactro::handchams::registerModule();
-    bactro::phasehud::registerModule();
 }
 
 } // namespace
@@ -285,23 +272,15 @@ public:
 
     bool disable(pl::mod::ModContext&) {
         onPerfToggle("", false);
-        bactro::handshader::shutdown();
-        bactro::motionblur::shutdown();
-        bactro::itemglint::shutdown();
-        bactro::outline::shutdown();
-        bactro::phasehud::shutdown();
-        bactro::handchams::shutdown();
+                bactro::motionblur::shutdown();
+                                bactro::handchams::shutdown();
         return true;
     }
 
     bool unload(pl::mod::ModContext&) {
         onPerfToggle("", false);
-        bactro::handshader::shutdown();
-        bactro::motionblur::shutdown();
-        bactro::itemglint::shutdown();
-        bactro::outline::shutdown();
-        bactro::phasehud::shutdown();
-        bactro::handchams::shutdown();
+                bactro::motionblur::shutdown();
+                                bactro::handchams::shutdown();
         return true;
     }
 };

@@ -94,6 +94,15 @@ void setEntityConstantsDetour(
     float uvRot1, float uvRot2) {
     if (!g_setEntityConstants) return;
 
+    {
+        static int s_enter = 0;
+        if (s_enter < 15) {
+            logLine("HandChams: setEntityConstants ENTER #%d en=%d", s_enter,
+                    g_enabled.load() ? 1 : 0);
+            ++s_enter;
+        }
+    }
+
     if (wantChams()) {
         const Color fill = makeFill();
         // Solid-ish fill via changeColor; soft white outer via overlay (glow slider)
