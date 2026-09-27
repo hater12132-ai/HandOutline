@@ -134,6 +134,11 @@ enum class SignatureId : std::uint16_t {
     ActorGetOffhandSlot,
     RenderPotionEffects,
     CompressedPeerReceive,
+    ActorGetHealth,
+    ActorGetMaxHealth,
+    ActorGetAttribute,
+    AttributeInstanceGetCurrentValue,
+    AttributeInstanceGetMaxValue,
     Count
 };
 
