@@ -207,94 +207,12 @@ bool readHealthFromAttributeMap(void* /*actor*/, float& /*hp*/, float& /*maxHp*/
 // AttributeInstance floats (1.26.51.1): current @ +0x18, max @ +0x1c
 // The unique "getHealth" sigs are methods on an object that HAS AttributeInstance* at +0x38 —
 // they are NOT Actor methods. Calling them with Actor* crashes. Do not call them on Actor.
-// AttributeInstance (1.26.51.1): current float @ +0x18, max float @ +0x1c
-// Owner object used by RE'd getters: AttributeInstance* @ owner+0x38
-static bool libRange(uintptr_t codePtr) {
-    static uintptr_t lo = 0, hi = 0;
-    if (!lo) {
-        Dl_info info{};
-        void* sym = g_hitGetEntity ? reinterpret_cast<void*>(g_hitGetEntity)
-                                   : reinterpret_cast<void*>(g_getNameTag);
-        if (sym && dladdr(sym, &info) && info.dli_fbase) {
-            lo = reinterpret_cast<uintptr_t>(info.dli_fbase);
-            hi = lo + 0x20000000ULL;
-        }
-    }
-    if (!lo) return true;
-    return codePtr >= lo && codePtr < hi;
-}
-
-static bool looksLikeObject(void* p) {
-    if (!p) return false;
-    const auto v = reinterpret_cast<uintptr_t>(p);
-    if (v < 0x10000000ULL || (v & 7ULL)) return false;
-    void** vt = *reinterpret_cast<void***>(p);
-    if (!vt) return false;
-    return libRange(reinterpret_cast<uintptr_t>(vt[0]));
-}
-
-bool readHealthFromInstance(void* inst, float& hp, float& maxHp) {
-    if (!looksLikeObject(inst)) return false;
-    auto* base = reinterpret_cast<unsigned char*>(inst);
-    float cur = *reinterpret_cast<float*>(base + 0x18);
-    float mx = *reinterpret_cast<float*>(base + 0x1c);
-    if (!(mx >= 1.f && mx <= 1024.f && cur >= 0.f && cur <= mx + 1.f)) return false;
-    if (cur != cur || mx != mx) return false; // NaN
-    hp = cur;
-    maxHp = mx;
-    return true;
-}
-
-bool readHealth(void* actor, float& hp, float& maxHp, float& absor) {
+// HP disabled for stability — memory scans on Actor caused SIGSEGV.
+// Name card only until we have a verified Actor->AttributeInstance call path.
+bool readHealth(void* /*actor*/, float& hp, float& maxHp, float& absor) {
+    hp = -1.f;
+    maxHp = 20.f;
     absor = 0.f;
-    if (!actor || !looksLikeObject(actor)) return false;
-
-    auto* ab = reinterpret_cast<unsigned char*>(actor);
-
-    // Path A: actor is the RE'd owner type (AttributeInstance* at +0x38)
-    {
-        void* inst = *reinterpret_cast<void**>(ab + 0x38);
-        if (readHealthFromInstance(inst, hp, maxHp)) {
-            static int s_log = 0;
-            if (s_log < 4) {
-                logLine("TargetHUD: HP via actor+0x38 inst hp=%.1f/%.1f", hp, maxHp);
-                ++s_log;
-            }
-            return true;
-        }
-    }
-
-    // Path B: scan actor fields for AttributeInstance* (vtable + health floats)
-    static const int kOffs[] = {
-        0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78,
-        0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8, 0xC0, 0xC8, 0xD0,
-        0xE0, 0xF0, 0x100, 0x110, 0x120, 0x130, 0x140, 0x150, 0x160, 0x180,
-        0x1A0, 0x1C0, 0x1E0, 0x200, 0x220, 0x240, 0x260, 0x280, 0x2A0, 0x2C0,
-        0x300, 0x340, 0x380, 0x3C0, 0x400, 0x440, 0x480, 0x4C0, 0x500
-    };
-    for (int off : kOffs) {
-        void* cand = *reinterpret_cast<void**>(ab + off);
-        if (readHealthFromInstance(cand, hp, maxHp)) {
-            static int s_log = 0;
-            if (s_log < 6) {
-                logLine("TargetHUD: HP via actor+0x%X inst hp=%.1f/%.1f", off, hp, maxHp);
-                ++s_log;
-            }
-            return true;
-        }
-        // Path C: field is owner type with AttributeInstance* at +0x38
-        if (looksLikeObject(cand)) {
-            void* inst = *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(cand) + 0x38);
-            if (readHealthFromInstance(inst, hp, maxHp)) {
-                static int s_log = 0;
-                if (s_log < 6) {
-                    logLine("TargetHUD: HP via actor+0x%X->+0x38 hp=%.1f/%.1f", off, hp, maxHp);
-                    ++s_log;
-                }
-                return true;
-            }
-        }
-    }
     return false;
 }
 
@@ -364,11 +282,9 @@ void updateTargetFromWorld() {
             ++s_hpLog;
         }
     } else {
-        static int s_miss = 0;
-        if (s_miss < 6) {
-            logLine("TargetHUD: ATTR miss on %s (no AttributeInstance)", ts.name.c_str());
-            ++s_miss;
-        }
+        // HP not available yet (safe mode) — card still shows name
+        ts.health = -1.f;
+        ts.maxHealth = 20.f;
     }
 
     const double t = nowSec();
