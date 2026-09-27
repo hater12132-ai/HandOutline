@@ -19,6 +19,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <csetjmp>
+#include <csignal>
 
 #define TH_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "BactroNative", __VA_ARGS__)
 
@@ -88,12 +90,100 @@ ActorIsPlayerFn g_isPlayer = nullptr;
 ActorGetNameTagFn g_getNameTag = nullptr;
 
 void* g_clientInstance = nullptr;
-void* g_level = nullptr; // captured via LevelInit (safe — never probe-call)
+void* g_level = nullptr;
+int g_levelOff = -1; // cached ClientInstance offset once found
+std::atomic_bool g_levelSearchDone{false};
 
 using LevelInitFn = void (*)(void*, void*, void*, void*, void*, void*);
 LevelInitFn g_levelInitOrig = nullptr;
 
 std::mutex g_targetMu;
+
+// One-time SIGSEGV-safe probe: find Level* on ClientInstance by trying LevelGetHitResult.
+thread_local sigjmp_buf g_probeJmp;
+thread_local volatile bool g_inProbe = false;
+
+void probeSegvHandler(int) {
+    if (g_inProbe) siglongjmp(g_probeJmp, 1);
+}
+
+bool looksLikeHeapPtr(void* p) {
+    auto v = reinterpret_cast<uintptr_t>(p);
+    return v > 0x10000000ULL && (v & 0x7ULL) == 0;
+}
+
+void* tryDiscoverLevel(void* clientInstance) {
+    if (!clientInstance || !g_levelGetHit) return nullptr;
+    if (g_level) return g_level;
+    if (g_levelSearchDone.load(std::memory_order_relaxed) && g_levelOff < 0)
+        return nullptr; // already failed
+
+    // Fast path: cached offset
+    if (g_levelOff >= 0) {
+        void* cand = *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(clientInstance) + g_levelOff);
+        if (looksLikeHeapPtr(cand)) return cand;
+        g_levelOff = -1; // stale
+    }
+
+    struct sigaction sa{}, oldSa{};
+    sa.sa_handler = probeSegvHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGSEGV, &sa, &oldSa) != 0) return nullptr;
+    struct sigaction oldBus{};
+    sigaction(SIGBUS, &sa, &oldBus);
+
+    static const int kOffs[] = {
+        0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8, 0x100, 0x108, 0x110, 0x118, 0x120,
+        0x128, 0x130, 0x138, 0x140, 0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x180,
+        0x190, 0x1A0, 0x1B0, 0x1C0, 0x1D0, 0x1E0, 0x200, 0x220, 0x240, 0x260, 0x280,
+        0x2A0, 0x2C0, 0x300, 0x340, 0x380, 0x3C0, 0x400, 0x440, 0x480, 0x4C0, 0x500
+    };
+
+    void* found = nullptr;
+    int foundOff = -1;
+    auto* base = reinterpret_cast<unsigned char*>(clientInstance);
+
+    for (int off : kOffs) {
+        void* cand = *reinterpret_cast<void**>(base + off);
+        if (!looksLikeHeapPtr(cand)) continue;
+
+        g_inProbe = true;
+        if (sigsetjmp(g_probeJmp, 1) == 0) {
+            void* hr = g_levelGetHit(cand);
+            g_inProbe = false;
+            if (hr && looksLikeHeapPtr(hr)) {
+                // Also require HitResultGetEntity not to explode on it
+                g_inProbe = true;
+                if (sigsetjmp(g_probeJmp, 1) == 0) {
+                    void* ent = g_hitGetEntity ? g_hitGetEntity(hr) : nullptr;
+                    g_inProbe = false;
+                    // success: valid Level* (entity may be null if looking at sky)
+                    found = cand;
+                    foundOff = off;
+                    break;
+                }
+                g_inProbe = false;
+                // getEntity crashed — not a good HitResult; skip
+            }
+        } else {
+            g_inProbe = false; // recovered from SEGV
+        }
+    }
+
+    sigaction(SIGSEGV, &oldSa, nullptr);
+    sigaction(SIGBUS, &oldBus, nullptr);
+
+    g_levelSearchDone.store(true, std::memory_order_relaxed);
+    if (found) {
+        g_level = found;
+        g_levelOff = foundOff;
+        logLine("TargetHUD: Level* found via CI+0x%X @%p", foundOff, found);
+    } else {
+        logLine("TargetHUD: Level* discovery failed (no safe CI offset)");
+    }
+    return found;
+}
 
 struct TargetState {
     void* actor = nullptr;
@@ -235,8 +325,8 @@ void updateTargetFromWorld() {
     TargetState ts{};
     ts.lastSeen = nowSec();
 
-    void* level = g_level;
-    if (!level) return; // wait for LevelInit
+    void* level = g_level ? g_level : tryDiscoverLevel(g_clientInstance);
+    if (!level) return;
 
     void* hit = g_levelGetHit(level);
     if (!hit) return;
@@ -757,7 +847,7 @@ void onSignaturesReady() {
         g_getHealth = reinterpret_cast<ActorGetHealthFn>(a);
         logLine("TargetHUD: ActorGetHealth @%p", reinterpret_cast<void*>(a));
     } else {
-        logLine("TargetHUD: ActorGetHealth MISSING (using AttributeMap walk)");
+        logLine("TargetHUD: ActorGetHealth MISSING (HP bar needs this sig)");
     }
     if (auto a = resolve(SignatureId::ActorGetMaxHealth)) {
         g_getMaxHealth = reinterpret_cast<ActorGetMaxHealthFn>(a);
@@ -777,11 +867,16 @@ void onSignaturesReady() {
     }
 
     void* o = nullptr;
-    if (hook(SignatureId::LevelInit, reinterpret_cast<void*>(&levelInitDetour), &o) && o) {
-        g_levelInitOrig = reinterpret_cast<LevelInitFn>(o); // multi-arg forward
-        logLine("TargetHUD: LevelInit hooked (Level* capture)");
+    if (auto a = resolve(SignatureId::LevelInit)) {
+        logLine("TargetHUD: LevelInit @%p", reinterpret_cast<void*>(a));
+        if (hook(SignatureId::LevelInit, reinterpret_cast<void*>(&levelInitDetour), &o) && o) {
+            g_levelInitOrig = reinterpret_cast<LevelInitFn>(o);
+            logLine("TargetHUD: LevelInit hooked");
+        } else {
+            logLine("TargetHUD: LevelInit hook FAIL (will probe CI for Level*)");
+        }
     } else {
-        logLine("TargetHUD: LevelInit HOOK FAIL — crosshair target needs Level*");
+        logLine("TargetHUD: LevelInit sig MISSING (will probe CI for Level*)");
     }
     o = nullptr;
     if (hook(SignatureId::ClientInstanceUpdate, reinterpret_cast<void*>(&clientInstanceUpdateDetour), &o) && o) {
@@ -790,7 +885,7 @@ void onSignaturesReady() {
     } else {
         logLine("TargetHUD: ClientInstanceUpdate HOOK FAIL");
     }
-    logLine("TargetHUD: ready (safe Level* + HitResult; Attribute HP needs getHealth sig)");
+    logLine("TargetHUD: ready");
 }
 
 void onPostFrame() {
