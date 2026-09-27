@@ -16,11 +16,11 @@ def main() -> int:
         "type": "preload-native",
         "name": "BactroNative",
         "author": "hater12132-ai",
-        "version": "1.10.4",
+        "version": "1.11.0",
         "entry": "libBactroNative.so",
         "icon": "icon.png",
         "minecraft_versions": ["1.26.51.1"],
-        "description": "Perf + MotionBlur + Phase Outline Phase HUD 1.8.1.",
+        "description": "Lexora SkyShaders (Midnight/Plasma/Aurora/Water/Caustic/Thunder/Pulsar) + Perf + MotionBlur + HandChams + WireOutline.",
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():

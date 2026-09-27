@@ -1,10 +1,14 @@
-# BactroNative 1.6.3
+# BactroNative 1.11.0
 
 ## What works on Levi Android (PL hooks only)
 - Performance (VSync, fullbright)
 - Motion Blur (framebuffer blend)
 - Hand hide
 - Item Glint: **white enchantment foil** on held items when the game draws the foil layer
+- **Sky Shaders (Lexora ports, fully animated):** Midnight, Plasma, Aurora, Water, Caustic, Thunder, Pulsar
+  - Enable **Sky Shaders (Lexora)** in Mod Menu
+  - Mode: 0=Midnight 1=Plasma 2=Aurora 3=Water 4=Caustic 5=Thunder 6=Pulsar
+  - Motion driven by continuous GameTime/uTime (same as Lexora)
 
 ## Why Phase-style galaxy + white silhouette outline is harder
 Phase (Windows Bedrock) can inject **RenderDragon materials** (`.material.bin`) and rewrite `iteminhand` shaders.

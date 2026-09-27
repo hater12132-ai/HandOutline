@@ -2,6 +2,7 @@
 #include "bactro/MotionBlur.hpp"
 #include "bactro/HandChams.hpp"
 #include "bactro/WireOutline.hpp"
+#include "bactro/SkyShaders.hpp"
 #include "bactro/Status.hpp"
 #include "Version.hpp"
 
@@ -186,6 +187,7 @@ void resolveEverythingAsync() {
                 bactro::motionblur::onSignaturesReady();
                         bactro::handchams::onSignaturesReady();
         bactro::wireoutline::onSignaturesReady();
+        bactro::skyshaders::onSignaturesReady();
                 writeStatus("async init finished");
     }).detach();
 }
@@ -242,6 +244,7 @@ void registerMenus() {
     bactro::motionblur::registerModule();
     bactro::handchams::registerModule();
     bactro::wireoutline::registerModule();
+    bactro::skyshaders::registerModule();
 }
 
 } // namespace
@@ -278,6 +281,7 @@ public:
                 bactro::motionblur::shutdown();
                                 bactro::handchams::shutdown();
         bactro::wireoutline::shutdown();
+        bactro::skyshaders::shutdown();
         return true;
     }
 
@@ -286,6 +290,7 @@ public:
                 bactro::motionblur::shutdown();
                                 bactro::handchams::shutdown();
         bactro::wireoutline::shutdown();
+        bactro::skyshaders::shutdown();
         return true;
     }
 };
