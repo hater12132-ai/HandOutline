@@ -91,7 +91,8 @@ ActorGetNameTagFn g_getNameTag = nullptr;
 
 void* g_clientInstance = nullptr;
 void* g_level = nullptr;
-std::atomic_bool g_levelFromHit{false};
+void* g_crosshairActor = nullptr; // set only from HitResultGetEntity hook (game-validated)
+std::mutex g_crosshairMu;
 
 using LevelInitFn = void (*)(void*, void*, void*, void*, void*, void*);
 LevelInitFn g_levelInitOrig = nullptr;
@@ -100,17 +101,16 @@ std::mutex g_targetMu;
 
 void logLine(const char* fmt, ...); // defined below
 
-// Game calls Level::getHitResult() every frame with the real Level* — capture it.
-void* levelGetHitResultDetour(void* level) {
-    if (level) {
-        g_level = level;
-        g_levelFromHit.store(true, std::memory_order_relaxed);
-    }
-    return g_levelGetHitOrig ? g_levelGetHitOrig(level) : nullptr;
+void noteCrosshairEntity(void* actor) {
+    if (!actor) return;
+    std::lock_guard lock(g_crosshairMu);
+    g_crosshairActor = actor;
 }
 
 void* hitResultGetEntityDetour(void* hit) {
     void* ent = g_hitGetEntityOrig ? g_hitGetEntityOrig(hit) : nullptr;
+    if (ent && g_enabled.load(std::memory_order_relaxed))
+        noteCrosshairEntity(ent);
     return ent;
 }
 
@@ -204,17 +204,53 @@ bool readHealthFromAttributeMap(void* /*actor*/, float& /*hp*/, float& /*maxHp*/
     return false; // disabled: unsafe without verified AttributeInstance layout
 }
 
-// 1.26.51.1 AttributeInstance layout (from RE): current @ +0x18, max @ +0x1c (float)
-// Methods at 0x9a9f5ac / 0x9a9f5bc: LDR X8,[X0,#0x38]; LDR S0,[X8,#0x18|0x1c]; FCVTZS W0,S0; RET
+// AttributeInstance floats (1.26.51.1): current @ +0x18, max @ +0x1c
+// The unique "getHealth" sigs are methods on an object that HAS AttributeInstance* at +0x38 —
+// they are NOT Actor methods. Calling them with Actor* crashes. Do not call them on Actor.
+bool ptrInMinecraftLib(void* p) {
+    if (!p) return false;
+    const auto v = reinterpret_cast<uintptr_t>(p);
+    if (v < 0x10000000ULL || (v & 7ULL)) return false;
+    static uintptr_t lo = 0, hi = 0;
+    if (!lo) {
+        Dl_info info{};
+        void* sym = g_hitGetEntity ? reinterpret_cast<void*>(g_hitGetEntity)
+                                   : reinterpret_cast<void*>(g_getNameTag);
+        if (sym && dladdr(sym, &info) && info.dli_fbase) {
+            lo = reinterpret_cast<uintptr_t>(info.dli_fbase);
+            hi = lo + 0x20000000ULL;
+        }
+    }
+    if (!lo) return false;
+    // heap objects are NOT in the lib image — this checks vtable code ptrs
+    return true; // pointer magnitude OK only
+}
+
 bool readHealthFromInstance(void* inst, float& hp, float& maxHp) {
     if (!inst) return false;
     const auto v = reinterpret_cast<uintptr_t>(inst);
-    if (v < 0x10000000ULL || (v & 3ULL)) return false;
+    if (v < 0x10000000ULL || (v & 7ULL)) return false;
+    // Require vtable pointer to land in libminecraftpe (object is a real C++ instance)
+    void** vt = *reinterpret_cast<void***>(inst);
+    if (!vt) return false;
+    const auto slot0 = reinterpret_cast<uintptr_t>(vt[0]);
+    static uintptr_t libLo = 0, libHi = 0;
+    if (!libLo) {
+        Dl_info info{};
+        void* sym = g_hitGetEntity ? reinterpret_cast<void*>(g_hitGetEntity)
+                                   : reinterpret_cast<void*>(g_getNameTag);
+        if (sym && dladdr(sym, &info) && info.dli_fbase) {
+            libLo = reinterpret_cast<uintptr_t>(info.dli_fbase);
+            libHi = libLo + 0x20000000ULL;
+        }
+    }
+    if (libLo && (slot0 < libLo || slot0 >= libHi)) return false;
+
     auto* base = reinterpret_cast<unsigned char*>(inst);
     float cur = *reinterpret_cast<float*>(base + 0x18);
     float mx = *reinterpret_cast<float*>(base + 0x1c);
-    if (!std::isfinite(cur) || !std::isfinite(mx)) return false;
-    if (mx < 1.f || mx > 1024.f || cur < 0.f || cur > mx + 1.f) return false;
+    if (!(mx >= 1.f && mx <= 1024.f && cur >= 0.f && cur <= mx + 1.f)) return false;
+    if (cur != cur || mx != mx) return false;
     hp = cur;
     maxHp = mx;
     return true;
@@ -223,44 +259,10 @@ bool readHealthFromInstance(void* inst, float& hp, float& maxHp) {
 bool readHealth(void* actor, float& hp, float& maxHp, float& absor) {
     absor = 0.f;
     if (!actor) return false;
-
-    // 1) Resolved getHealth / getMaxHealth (1.26.51.1 unique patterns)
-    if (g_getHealth && g_getMaxHealth) {
-        int h = g_getHealth(actor);
-        int m = g_getMaxHealth(actor);
-        if (m > 0 && m <= 1024 && h >= 0 && h <= m + 4) {
-            hp = static_cast<float>(h);
-            maxHp = static_cast<float>(m);
-            return true;
-        }
-    }
-
-    // 2) Object with AttributeInstance* at +0x38 (same layout the sig methods use)
-    {
-        void* inst = *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(actor) + 0x38);
-        if (readHealthFromInstance(inst, hp, maxHp)) return true;
-    }
-
-    // 3) Scan actor for AttributeInstance* (current@+0x18, max@+0x1c)
-    static const int kOffs[] = {
-        0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78,
-        0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8, 0xC0, 0xC8,
-        0xD0, 0xE0, 0xF0, 0x100, 0x120, 0x140, 0x160, 0x180, 0x1A0, 0x1C0,
-        0x1E0, 0x200, 0x220, 0x240, 0x280, 0x2C0, 0x300, 0x340, 0x380, 0x3C0
-    };
-    auto* abase = reinterpret_cast<unsigned char*>(actor);
-    for (int off : kOffs) {
-        void* cand = *reinterpret_cast<void**>(abase + off);
-        float th, tm;
-        if (readHealthFromInstance(cand, th, tm)) {
-            // Prefer player default max 20
-            if (tm == 20.f || tm == 40.f || (tm >= 8.f && tm <= 100.f)) {
-                hp = th;
-                maxHp = tm;
-                return true;
-            }
-        }
-    }
+    // Only read AttributeInstance* at actor+0x38 if vtable validates
+    auto* ab = reinterpret_cast<unsigned char*>(actor);
+    void* inst = *reinterpret_cast<void**>(ab + 0x38);
+    if (readHealthFromInstance(inst, hp, maxHp)) return true;
     return false;
 }
 
@@ -294,21 +296,18 @@ std::string readNameTag(void* actor) {
 
 
 void updateTargetFromWorld() {
-
     if (!g_enabled.load(std::memory_order_relaxed)) return;
-    if (!g_clientInstance || !g_levelGetHit || !g_hitGetEntity) return;
+    if (!g_clientInstance) return;
+
+    void* actor = nullptr;
+    {
+        std::lock_guard lock(g_crosshairMu);
+        actor = g_crosshairActor;
+    }
+    if (!actor) return;
 
     TargetState ts{};
     ts.lastSeen = nowSec();
-
-    void* level = g_level;
-    if (!level) return; // filled by LevelGetHitResult hook
-
-    void* hit = (g_levelGetHitOrig ? g_levelGetHitOrig : g_levelGetHit)(level);
-    if (!hit) return;
-
-    void* actor = (g_hitGetEntityOrig ? g_hitGetEntityOrig : g_hitGetEntity)(hit);
-    if (!actor) return;
 
     if (g_playersOnly.load(std::memory_order_relaxed) && g_isPlayer) {
         if (!g_isPlayer(actor)) return;
@@ -804,14 +803,7 @@ void onSignaturesReady() {
     }
     if (auto a = resolve(SignatureId::LevelGetHitResult)) {
         g_levelGetHit = reinterpret_cast<LevelGetHitResultFn>(a);
-        logLine("TargetHUD: LevelGetHitResult @%p", reinterpret_cast<void*>(a));
-        void* o = nullptr;
-        if (hook(SignatureId::LevelGetHitResult, reinterpret_cast<void*>(&levelGetHitResultDetour), &o) && o) {
-            g_levelGetHitOrig = reinterpret_cast<LevelGetHitResultFn>(o);
-            logLine("TargetHUD: LevelGetHitResult HOOKED (Level* capture)");
-        } else {
-            logLine("TargetHUD: LevelGetHitResult hook FAIL");
-        }
+        logLine("TargetHUD: LevelGetHitResult @%p (not hooked — too short)", reinterpret_cast<void*>(a));
     }
     if (auto a = resolve(SignatureId::HitResultGetEntity)) {
         g_hitGetEntity = reinterpret_cast<HitResultGetEntityFn>(a);
@@ -819,7 +811,9 @@ void onSignaturesReady() {
         void* o = nullptr;
         if (hook(SignatureId::HitResultGetEntity, reinterpret_cast<void*>(&hitResultGetEntityDetour), &o) && o) {
             g_hitGetEntityOrig = reinterpret_cast<HitResultGetEntityFn>(o);
-            logLine("TargetHUD: HitResultGetEntity HOOKED");
+            logLine("TargetHUD: HitResultGetEntity HOOKED (crosshair entity capture)");
+        } else {
+            logLine("TargetHUD: HitResultGetEntity hook FAIL");
         }
     }
     if (auto a = resolve(SignatureId::ActorIsPlayer)) {
@@ -833,7 +827,7 @@ void onSignaturesReady() {
     // Attribute / health
     if (auto a = resolve(SignatureId::ActorGetHealth)) {
         g_getHealth = reinterpret_cast<ActorGetHealthFn>(a);
-        logLine("TargetHUD: ActorGetHealth @%p", reinterpret_cast<void*>(a));
+        logLine("TargetHUD: ActorGetHealth @%p (layout ref, not called on Actor)", reinterpret_cast<void*>(a));
     } else {
         logLine("TargetHUD: ActorGetHealth MISSING (HP bar needs this sig)");
     }
