@@ -88,6 +88,11 @@ ActorIsPlayerFn g_isPlayer = nullptr;
 ActorGetNameTagFn g_getNameTag = nullptr;
 
 void* g_clientInstance = nullptr;
+void* g_level = nullptr; // captured via LevelInit (safe — never probe-call)
+
+using LevelInitFn = void (*)(void*, void*, void*, void*, void*, void*);
+LevelInitFn g_levelInitOrig = nullptr;
+
 std::mutex g_targetMu;
 
 struct TargetState {
@@ -168,88 +173,25 @@ bool readHealthFromAttributeInstance(void* inst, float& hp, float& maxHp) {
 }
 
 // Walk Actor for BaseAttributeMap* then AttributeInstance records containing health.
-bool readHealthFromAttributeMap(void* actor, float& hp, float& maxHp, float& absor) {
-    if (!actor) return false;
-    auto* abase = reinterpret_cast<unsigned char*>(actor);
-    absor = 0.f;
-
-    // Candidate pointer offsets for AttributeMap / component holders on Actor
-    static const int kMapOff[] = {
-        0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xD8,
-        0xE0, 0xE8, 0xF0, 0xF8, 0x100, 0x108, 0x110, 0x118, 0x120, 0x128,
-        0x130, 0x140, 0x150, 0x160, 0x170, 0x180, 0x190, 0x1A0, 0x1B0, 0x1C0,
-        0x1E0, 0x200, 0x220, 0x240, 0x260, 0x280, 0x2A0, 0x2C0, 0x2E0, 0x300,
-        0x320, 0x340, 0x360, 0x380, 0x3A0, 0x3C0, 0x3E0, 0x400, 0x450, 0x4A0,
-        0x500, 0x550, 0x5A0, 0x600, 0x680, 0x700, 0x780, 0x800
-    };
-
-    for (int off : kMapOff) {
-        void* cand = *reinterpret_cast<void**>(abase + off);
-        if (!cand) continue;
-        uintptr_t cv = reinterpret_cast<uintptr_t>(cand);
-        if (cv < 0x10000000ULL || (cv & 7ULL)) continue;
-
-        // Treat cand as start of a region containing AttributeInstance-like objects.
-        // Also try cand as pointer-to-map where +0/+8/+16 are begin/end style.
-        void* regions[4] = {cand, nullptr, nullptr, nullptr};
-        auto* cb = reinterpret_cast<unsigned char*>(cand);
-        regions[1] = *reinterpret_cast<void**>(cb + 0);
-        regions[2] = *reinterpret_cast<void**>(cb + 8);
-        regions[3] = *reinterpret_cast<void**>(cb + 16);
-
-        for (void* reg : regions) {
-            if (!reg) continue;
-            uintptr_t rv = reinterpret_cast<uintptr_t>(reg);
-            if (rv < 0x10000000ULL) continue;
-            auto* rb = reinterpret_cast<unsigned char*>(reg);
-            // Scan a window of AttributeInstance-sized slots (~0x40–0x80 each)
-            for (int slot = 0; slot < 0x800; slot += 0x20) {
-                float thp = -1.f, tmax = -1.f;
-                if (readHealthFromAttributeInstance(rb + slot, thp, tmax)) {
-                    // Prefer player default max 20
-                    if (tmax == 20.f || tmax == 40.f || (tmax >= 8.f && tmax <= 40.f)) {
-                        hp = thp;
-                        maxHp = tmax;
-                        // look nearby for absorption (max often 16 or small)
-                        for (int aoff = slot + 0x40; aoff < slot + 0x200 && aoff < 0x800; aoff += 0x20) {
-                            float ah = -1.f, am = -1.f;
-                            if (readHealthFromAttributeInstance(rb + aoff, ah, am)) {
-                                if (am >= 1.f && am <= 32.f && ah >= 0.f && ah <= am + 0.5f && am != 20.f && am != 40.f) {
-                                    absor = ah;
-                                    break;
-                                }
-                            }
-                        }
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    return false;
+// SAFE health read: only use resolved getHealth/getMaxHealth.
+// AttributeMap memory walks were removed — they caused SIGSEGV on invalid pointers.
+// When getHealth sig is missing, HUD still shows name; HP shows as unknown until sig is fixed.
+bool readHealthFromAttributeMap(void* /*actor*/, float& /*hp*/, float& /*maxHp*/, float& /*absor*/) {
+    return false; // disabled: unsafe without verified AttributeInstance layout
 }
 
 bool readHealth(void* actor, float& hp, float& maxHp, float& absor) {
     absor = 0.f;
-    // 1) Actor::getHealth / getMaxHealth if hooked
+    if (!actor) return false;
     if (g_getHealth && g_getMaxHealth) {
-        try {
-            int h = g_getHealth(actor);
-            int m = g_getMaxHealth(actor);
-            if (m > 0 && m <= 1024 && h >= 0 && h <= m + 4) {
-                hp = static_cast<float>(h);
-                maxHp = static_cast<float>(m);
-                // still try map for absorption
-                float dummyHp, dummyMax, ab = 0.f;
-                if (readHealthFromAttributeMap(actor, dummyHp, dummyMax, ab))
-                    absor = ab;
-                return true;
-            }
-        } catch (...) {}
+        int h = g_getHealth(actor);
+        int m = g_getMaxHealth(actor);
+        if (m > 0 && m <= 1024 && h >= 0 && h <= m + 4) {
+            hp = static_cast<float>(h);
+            maxHp = static_cast<float>(m);
+            return true;
+        }
     }
-    // 2) AttributeMap / AttributeInstance walk
-    if (readHealthFromAttributeMap(actor, hp, maxHp, absor))
-        return true;
     return false;
 }
 
@@ -280,76 +222,34 @@ std::string readNameTag(void* actor) {
     return out.empty() ? "Player" : out;
 }
 
-void* tryGetLevel(void* clientInstance) {
-    if (!clientInstance || !g_levelGetHit) return nullptr;
-    auto* base = reinterpret_cast<unsigned char*>(clientInstance);
-    static const int kOffs[] = {
-        0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8,
-        0x100, 0x108, 0x110, 0x118, 0x120, 0x128, 0x130, 0x138,
-        0x140, 0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x180,
-        0x190, 0x1A0, 0x1B0, 0x1C0, 0x1E0, 0x200, 0x220, 0x240,
-        0x280, 0x2C0, 0x300, 0x340, 0x380, 0x3C0, 0x400
-    };
-    for (int off : kOffs) {
-        void* cand = *reinterpret_cast<void**>(base + off);
-        if (!cand) continue;
-        uintptr_t v = reinterpret_cast<uintptr_t>(cand);
-        if (v < 0x10000000ULL) continue;
-        void* hr = nullptr;
-        try {
-            hr = g_levelGetHit(cand);
-        } catch (...) {
-            continue;
-        }
-        if (hr) return cand;
-    }
-    return nullptr;
+void levelInitDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5) {
+    g_level = self;
+    if (g_levelInitOrig) g_levelInitOrig(self, a1, a2, a3, a4, a5);
 }
 
 void updateTargetFromWorld() {
+
     if (!g_enabled.load(std::memory_order_relaxed)) return;
     if (!g_clientInstance || !g_levelGetHit || !g_hitGetEntity) return;
 
     TargetState ts{};
     ts.lastSeen = nowSec();
 
-    void* level = tryGetLevel(g_clientInstance);
-    if (!level) return;
+    void* level = g_level;
+    if (!level) return; // wait for LevelInit
 
-    void* hit = nullptr;
-    try {
-        hit = g_levelGetHit(level);
-    } catch (...) {
-        return;
-    }
+    void* hit = g_levelGetHit(level);
     if (!hit) return;
 
-    void* actor = nullptr;
-    try {
-        actor = g_hitGetEntity(hit);
-    } catch (...) {
-        return;
-    }
+    void* actor = g_hitGetEntity(hit);
     if (!actor) return;
 
     if (g_playersOnly.load(std::memory_order_relaxed) && g_isPlayer) {
-        bool isP = false;
-        try {
-            isP = g_isPlayer(actor);
-        } catch (...) {
-            return;
-        }
-        if (!isP) return;
+        if (!g_isPlayer(actor)) return;
     }
 
-    // skip local player
     if (g_getLocalPlayer) {
-        void* lp = nullptr;
-        try {
-            lp = g_getLocalPlayer(g_clientInstance);
-        } catch (...) {
-            lp = nullptr;
-        }
+        void* lp = g_getLocalPlayer(g_clientInstance);
         if (lp && lp == actor) return;
     }
 
@@ -421,10 +321,13 @@ void updateTargetFromWorld() {
 void clientInstanceUpdateDetour(void* self, void* a1) {
     g_clientInstance = self;
     if (g_ciUpdateOrig) g_ciUpdateOrig(self, a1);
-    try {
-        updateTargetFromWorld();
-    } catch (...) {
-    }
+    if (!g_enabled.load(std::memory_order_relaxed)) return;
+    // throttle ~10 Hz to reduce risk / cost
+    static double s_last = 0.0;
+    double t = nowSec();
+    if (t - s_last < 0.1) return;
+    s_last = t;
+    updateTargetFromWorld();
 }
 
 // ---- GLES HUD (ProtoHax-style card: head | name + HP nums + bar) ----
@@ -874,13 +777,20 @@ void onSignaturesReady() {
     }
 
     void* o = nullptr;
+    if (hook(SignatureId::LevelInit, reinterpret_cast<void*>(&levelInitDetour), &o) && o) {
+        g_levelInitOrig = reinterpret_cast<LevelInitFn>(o); // multi-arg forward
+        logLine("TargetHUD: LevelInit hooked (Level* capture)");
+    } else {
+        logLine("TargetHUD: LevelInit HOOK FAIL — crosshair target needs Level*");
+    }
+    o = nullptr;
     if (hook(SignatureId::ClientInstanceUpdate, reinterpret_cast<void*>(&clientInstanceUpdateDetour), &o) && o) {
         g_ciUpdateOrig = reinterpret_cast<ClientInstanceUpdateFn>(o);
         logLine("TargetHUD: ClientInstanceUpdate hooked");
     } else {
         logLine("TargetHUD: ClientInstanceUpdate HOOK FAIL");
     }
-    logLine("TargetHUD: ready (draw via MotionBlur onPostFrame)");
+    logLine("TargetHUD: ready (safe Level* + HitResult; Attribute HP needs getHealth sig)");
 }
 
 void onPostFrame() {
