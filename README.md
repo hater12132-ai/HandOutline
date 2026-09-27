@@ -1,4 +1,4 @@
-# BactroNative 1.11.0
+# BactroNative 1.11.1
 
 ## What works on Levi Android (PL hooks only)
 - Performance (VSync, fullbright)

@@ -131,6 +131,7 @@ using PFN_glGetBooleanv = void (*)(GLenum, GLboolean*);
 using PFN_glIsEnabled = GLboolean (*)(GLenum);
 using PFN_glActiveTexture = void (*)(GLenum);
 using PFN_glBindTexture = void (*)(GLenum, GLuint);
+using PFN_glViewport = void (*)(GLint, GLint, GLsizei, GLsizei);
 
 PFN_glCreateShader p_glCreateShader = nullptr;
 PFN_glShaderSource p_glShaderSource = nullptr;
@@ -167,6 +168,7 @@ PFN_glGetBooleanv p_glGetBooleanv = nullptr;
 PFN_glIsEnabled p_glIsEnabled = nullptr;
 PFN_glActiveTexture p_glActiveTexture = nullptr;
 PFN_glBindTexture p_glBindTexture = nullptr;
+PFN_glViewport p_glViewport = nullptr;
 
 void logLine(const char* fmt, ...) {
     char buf[320];
@@ -224,8 +226,9 @@ bool loadGles() {
     LOAD(glIsEnabled);
     LOAD(glActiveTexture);
     LOAD(glBindTexture);
+    LOAD(glViewport);
     const bool ok = p_glCreateShader && p_glUseProgram && p_glDrawElements && p_glUniform1f &&
-                    p_glGenBuffers && p_glVertexAttribPointer;
+                    p_glGenBuffers && p_glVertexAttribPointer && p_glViewport;
     if (!ok) logLine("SkyShaders: missing GLES procs");
     return ok;
 }
@@ -823,9 +826,23 @@ void drawSky() {
         depthMaskWas = dm;
     }
 
-    GLint vp[4] = {0, 0, 1080, 1920};
-    p_glGetIntegerv(GL_VIEWPORT, vp);
-    float aspect = static_cast<float>(std::max(1, vp[2])) / static_cast<float>(std::max(1, vp[3]));
+    // CRITICAL: at swap time Minecraft often leaves a tiny UI viewport (corner of screen).
+    // Always size from the EGL surface and set a full viewport — same fix MotionBlur uses.
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
+    EGLint surfW = 0, surfH = 0;
+    if (dpy != EGL_NO_DISPLAY && surf != EGL_NO_SURFACE) {
+        eglQuerySurface(dpy, surf, EGL_WIDTH, &surfW);
+        eglQuerySurface(dpy, surf, EGL_HEIGHT, &surfH);
+    }
+    if (surfW <= 0 || surfH <= 0) {
+        GLint vp[4] = {0, 0, 1080, 1920};
+        p_glGetIntegerv(GL_VIEWPORT, vp);
+        surfW = std::max(1, vp[2]);
+        surfH = std::max(1, vp[3]);
+    }
+    p_glViewport(0, 0, surfW, surfH);
+    float aspect = static_cast<float>(surfW) / static_cast<float>(surfH);
 
     const float t = gameTime();
     const float speed = g_speed.load(std::memory_order_relaxed);
