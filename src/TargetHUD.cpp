@@ -95,6 +95,10 @@ std::atomic_bool g_levelSearchDone{false};
 using LevelInitFn = void (*)(void*, void*, void*, void*, void*, void*);
 LevelInitFn g_levelInitOrig = nullptr;
 
+std::mutex g_targetMu;
+
+void logLine(const char* fmt, ...); // defined below
+
 void levelInitDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5) {
     g_level = self;
     if (g_levelInitOrig) g_levelInitOrig(self, a1, a2, a3, a4, a5);
