@@ -83,14 +83,15 @@ AttrInstGetFloatFn g_attrMax = nullptr;
 ClientInstanceUpdateFn g_ciUpdateOrig = nullptr;
 GetLocalPlayerFn g_getLocalPlayer = nullptr;
 LevelGetHitResultFn g_levelGetHit = nullptr;
+LevelGetHitResultFn g_levelGetHitOrig = nullptr;
 HitResultGetEntityFn g_hitGetEntity = nullptr;
+HitResultGetEntityFn g_hitGetEntityOrig = nullptr;
 ActorIsPlayerFn g_isPlayer = nullptr;
 ActorGetNameTagFn g_getNameTag = nullptr;
 
 void* g_clientInstance = nullptr;
 void* g_level = nullptr;
-int g_levelOff = -1;
-std::atomic_bool g_levelSearchDone{false};
+std::atomic_bool g_levelFromHit{false};
 
 using LevelInitFn = void (*)(void*, void*, void*, void*, void*, void*);
 LevelInitFn g_levelInitOrig = nullptr;
@@ -99,77 +100,23 @@ std::mutex g_targetMu;
 
 void logLine(const char* fmt, ...); // defined below
 
+// Game calls Level::getHitResult() every frame with the real Level* — capture it.
+void* levelGetHitResultDetour(void* level) {
+    if (level) {
+        g_level = level;
+        g_levelFromHit.store(true, std::memory_order_relaxed);
+    }
+    return g_levelGetHitOrig ? g_levelGetHitOrig(level) : nullptr;
+}
+
+void* hitResultGetEntityDetour(void* hit) {
+    void* ent = g_hitGetEntityOrig ? g_hitGetEntityOrig(hit) : nullptr;
+    return ent;
+}
+
 void levelInitDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5) {
     g_level = self;
     if (g_levelInitOrig) g_levelInitOrig(self, a1, a2, a3, a4, a5);
-}
-
-// Vtable points into libminecraftpe.so?
-bool vtableInMinecraft(void* obj) {
-    if (!obj) return false;
-    const auto v = reinterpret_cast<uintptr_t>(obj);
-    if (v < 0x10000000ULL || (v & 7ULL)) return false;
-    void** vt = *reinterpret_cast<void***>(obj);
-    if (!vt) return false;
-    const auto slot0 = reinterpret_cast<uintptr_t>(vt[0]);
-    if (slot0 < 0x10000000ULL) return false;
-    static uintptr_t libLo = 0, libHi = 0;
-    if (!libLo && g_levelGetHit) {
-        Dl_info info{};
-        if (dladdr(reinterpret_cast<void*>(g_levelGetHit), &info) && info.dli_fbase) {
-            libLo = reinterpret_cast<uintptr_t>(info.dli_fbase);
-            libHi = libLo + 0xC000000ULL;
-        }
-    }
-    if (!libLo) return true;
-    return slot0 >= libLo && slot0 < libHi;
-}
-
-// Find Level* on ClientInstance (vtable filter, then LevelGetHitResult).
-// No signal handlers — only call getHitResult on vtable-validated objects.
-void* tryDiscoverLevel(void* clientInstance) {
-    if (!clientInstance || !g_levelGetHit) return nullptr;
-    if (g_level) return g_level;
-
-    auto* base = reinterpret_cast<unsigned char*>(clientInstance);
-
-    if (g_levelOff >= 0) {
-        void* cand = *reinterpret_cast<void**>(base + g_levelOff);
-        if (vtableInMinecraft(cand)) {
-            void* hr = g_levelGetHit(cand);
-            if (hr) {
-                g_level = cand;
-                return cand;
-            }
-        }
-        g_levelOff = -1;
-    }
-
-    if (g_levelSearchDone.load(std::memory_order_relaxed))
-        return nullptr;
-
-    static const int kOffs[] = {
-        0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8, 0x100, 0x108, 0x110, 0x118, 0x120,
-        0x128, 0x130, 0x138, 0x140, 0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x180,
-        0x190, 0x1A0, 0x1B0, 0x1C0, 0x1E0, 0x200, 0x220, 0x240, 0x280, 0x2C0, 0x300,
-        0x340, 0x380, 0x3C0, 0x400, 0x480, 0x500
-    };
-
-    for (int off : kOffs) {
-        void* cand = *reinterpret_cast<void**>(base + off);
-        if (!vtableInMinecraft(cand)) continue;
-        void* hr = g_levelGetHit(cand);
-        if (!hr) continue;
-        g_level = cand;
-        g_levelOff = off;
-        g_levelSearchDone.store(true, std::memory_order_relaxed);
-        logLine("TargetHUD: Level* @ CI+0x%X = %p", off, cand);
-        return cand;
-    }
-
-    g_levelSearchDone.store(true, std::memory_order_relaxed);
-    logLine("TargetHUD: Level* not found on ClientInstance");
-    return nullptr;
 }
 
 struct TargetState {
@@ -257,9 +204,27 @@ bool readHealthFromAttributeMap(void* /*actor*/, float& /*hp*/, float& /*maxHp*/
     return false; // disabled: unsafe without verified AttributeInstance layout
 }
 
+// 1.26.51.1 AttributeInstance layout (from RE): current @ +0x18, max @ +0x1c (float)
+// Methods at 0x9a9f5ac / 0x9a9f5bc: LDR X8,[X0,#0x38]; LDR S0,[X8,#0x18|0x1c]; FCVTZS W0,S0; RET
+bool readHealthFromInstance(void* inst, float& hp, float& maxHp) {
+    if (!inst) return false;
+    const auto v = reinterpret_cast<uintptr_t>(inst);
+    if (v < 0x10000000ULL || (v & 3ULL)) return false;
+    auto* base = reinterpret_cast<unsigned char*>(inst);
+    float cur = *reinterpret_cast<float*>(base + 0x18);
+    float mx = *reinterpret_cast<float*>(base + 0x1c);
+    if (!std::isfinite(cur) || !std::isfinite(mx)) return false;
+    if (mx < 1.f || mx > 1024.f || cur < 0.f || cur > mx + 1.f) return false;
+    hp = cur;
+    maxHp = mx;
+    return true;
+}
+
 bool readHealth(void* actor, float& hp, float& maxHp, float& absor) {
     absor = 0.f;
     if (!actor) return false;
+
+    // 1) Resolved getHealth / getMaxHealth (1.26.51.1 unique patterns)
     if (g_getHealth && g_getMaxHealth) {
         int h = g_getHealth(actor);
         int m = g_getMaxHealth(actor);
@@ -267,6 +232,33 @@ bool readHealth(void* actor, float& hp, float& maxHp, float& absor) {
             hp = static_cast<float>(h);
             maxHp = static_cast<float>(m);
             return true;
+        }
+    }
+
+    // 2) Object with AttributeInstance* at +0x38 (same layout the sig methods use)
+    {
+        void* inst = *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(actor) + 0x38);
+        if (readHealthFromInstance(inst, hp, maxHp)) return true;
+    }
+
+    // 3) Scan actor for AttributeInstance* (current@+0x18, max@+0x1c)
+    static const int kOffs[] = {
+        0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78,
+        0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8, 0xC0, 0xC8,
+        0xD0, 0xE0, 0xF0, 0x100, 0x120, 0x140, 0x160, 0x180, 0x1A0, 0x1C0,
+        0x1E0, 0x200, 0x220, 0x240, 0x280, 0x2C0, 0x300, 0x340, 0x380, 0x3C0
+    };
+    auto* abase = reinterpret_cast<unsigned char*>(actor);
+    for (int off : kOffs) {
+        void* cand = *reinterpret_cast<void**>(abase + off);
+        float th, tm;
+        if (readHealthFromInstance(cand, th, tm)) {
+            // Prefer player default max 20
+            if (tm == 20.f || tm == 40.f || (tm >= 8.f && tm <= 100.f)) {
+                hp = th;
+                maxHp = tm;
+                return true;
+            }
         }
     }
     return false;
@@ -309,13 +301,13 @@ void updateTargetFromWorld() {
     TargetState ts{};
     ts.lastSeen = nowSec();
 
-    void* level = g_level ? g_level : tryDiscoverLevel(g_clientInstance);
-    if (!level) return;
+    void* level = g_level;
+    if (!level) return; // filled by LevelGetHitResult hook
 
-    void* hit = g_levelGetHit(level);
+    void* hit = (g_levelGetHitOrig ? g_levelGetHitOrig : g_levelGetHit)(level);
     if (!hit) return;
 
-    void* actor = g_hitGetEntity(hit);
+    void* actor = (g_hitGetEntityOrig ? g_hitGetEntityOrig : g_hitGetEntity)(hit);
     if (!actor) return;
 
     if (g_playersOnly.load(std::memory_order_relaxed) && g_isPlayer) {
@@ -813,10 +805,22 @@ void onSignaturesReady() {
     if (auto a = resolve(SignatureId::LevelGetHitResult)) {
         g_levelGetHit = reinterpret_cast<LevelGetHitResultFn>(a);
         logLine("TargetHUD: LevelGetHitResult @%p", reinterpret_cast<void*>(a));
+        void* o = nullptr;
+        if (hook(SignatureId::LevelGetHitResult, reinterpret_cast<void*>(&levelGetHitResultDetour), &o) && o) {
+            g_levelGetHitOrig = reinterpret_cast<LevelGetHitResultFn>(o);
+            logLine("TargetHUD: LevelGetHitResult HOOKED (Level* capture)");
+        } else {
+            logLine("TargetHUD: LevelGetHitResult hook FAIL");
+        }
     }
     if (auto a = resolve(SignatureId::HitResultGetEntity)) {
         g_hitGetEntity = reinterpret_cast<HitResultGetEntityFn>(a);
         logLine("TargetHUD: HitResultGetEntity @%p", reinterpret_cast<void*>(a));
+        void* o = nullptr;
+        if (hook(SignatureId::HitResultGetEntity, reinterpret_cast<void*>(&hitResultGetEntityDetour), &o) && o) {
+            g_hitGetEntityOrig = reinterpret_cast<HitResultGetEntityFn>(o);
+            logLine("TargetHUD: HitResultGetEntity HOOKED");
+        }
     }
     if (auto a = resolve(SignatureId::ActorIsPlayer)) {
         g_isPlayer = reinterpret_cast<ActorIsPlayerFn>(a);
@@ -857,10 +861,10 @@ void onSignaturesReady() {
             g_levelInitOrig = reinterpret_cast<LevelInitFn>(o);
             logLine("TargetHUD: LevelInit hooked");
         } else {
-            logLine("TargetHUD: LevelInit hook FAIL (will probe CI for Level*)");
+            logLine("TargetHUD: LevelInit hook FAIL (OK — using LevelGetHitResult capture)");
         }
     } else {
-        logLine("TargetHUD: LevelInit sig MISSING (will probe CI for Level*)");
+        logLine("TargetHUD: LevelInit sig MISSING (OK — using LevelGetHitResult capture)");
     }
     o = nullptr;
     if (hook(SignatureId::ClientInstanceUpdate, reinterpret_cast<void*>(&clientInstanceUpdateDetour), &o) && o) {

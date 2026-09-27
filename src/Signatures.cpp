@@ -151,8 +151,8 @@ const std::array<SignatureDefinition, SignatureCount> definitions{{
     SignatureDefinition{SignatureId::RenderPotionEffects, "? ? ? A9 FD 03 00 91"},
 
     // Actor health / attributes (Bedrock AttributeMap). Patterns may need refresh per game build.
-    SignatureDefinition{SignatureId::ActorGetHealth, "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? F9 ? ? ? F9 ? ? ? B4 ? ? ? F9 ? ? ? B4 ? ? ? F9 ? ? ? 39 ? ? ? 36"},
-    SignatureDefinition{SignatureId::ActorGetMaxHealth, "? ? ? D1 ? ? ? A9 ? ? ? 91 ? ? ? F9 ? ? ? F9 ? ? ? B4 ? ? ? F9 ? ? ? B4 ? ? ? F9 ? ? ? BD"},
+    SignatureDefinition{SignatureId::ActorGetHealth, "08 1C 40 F9 00 19 40 BD 00 00 38 1E C0 03 5F D6"},  // 1.26.51.1 unique
+    SignatureDefinition{SignatureId::ActorGetMaxHealth, "08 1C 40 F9 00 1D 40 BD 00 00 38 1E C0 03 5F D6"},  // 1.26.51.1 unique
     SignatureDefinition{SignatureId::ActorGetAttribute, "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? F9 F3 03 00 AA F4 03 01 AA ? ? ? F9 ? ? ? F8"},
     SignatureDefinition{SignatureId::AttributeInstanceGetCurrentValue, "? ? ? B0 ? ? ? 91 ? ? ? B9 C0 03 5F D6"},
     SignatureDefinition{SignatureId::AttributeInstanceGetMaxValue, "? ? ? B0 ? ? ? 91 ? ? ? B9 C0 03 5F D6 ? ? ? B0"},
