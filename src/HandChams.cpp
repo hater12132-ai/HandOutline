@@ -34,15 +34,15 @@ std::atomic_bool g_enabled{false};
 std::atomic_bool g_handOnly{false};
 std::atomic_bool g_outlinePass{false}; // mesh multipass — weak on MC models; use box ESP
 std::atomic_bool g_throughWalls{false};
-std::atomic<float> g_r{0.88f};
-std::atomic<float> g_g{0.95f};
+std::atomic<float> g_r{1.00f};
+std::atomic<float> g_g{1.00f};
 std::atomic<float> g_b{1.00f};
-std::atomic<float> g_opacity{0.55f};
-std::atomic<float> g_intensity{1.35f};
+std::atomic<float> g_opacity{0.70f};
+std::atomic<float> g_intensity{1.5f};
 std::atomic_int g_hits{0};
 std::atomic_int g_meshHits{0};
 
-Color g_chams{0.88f, 0.95f, 1.00f, 0.55f};
+Color g_chams{1.00f, 1.00f, 1.00f, 0.70f};
 Color g_outline{1.00f, 1.00f, 1.00f, 1.00f};
 
 bool g_renderFpHooked = false;
@@ -74,15 +74,35 @@ bool looksLikeWorldPos(float x, float y, float z) {
 bool probeActorBox(void* actor, Box& out) {
     if (!actor) return false;
     auto* base = reinterpret_cast<unsigned char*>(actor);
-    static const int kPosOff[] = {0x48, 0x50, 0x68, 0x70, 0x88, 0x90, 0xA0, 0xB0, 0xC8, 0xD0,
-                                  0x100, 0x108, 0x120, 0x128, 0x148, 0x150, 0x168, 0x190,
-                                  0x1A0, 0x1C0, 0x1E0, 0x200, 0x220, 0x240, 0x280, 0x2A0,
-                                  0x2C0, 0x300, 0x340, 0x380, 0x3C0, 0x400};
+    // Wider scan — Bedrock actor layout moves a lot by version
+    static const int kPosOff[] = {
+        0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80,
+        0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xD8, 0xE0,
+        0xF0, 0xF8, 0x100, 0x108, 0x110, 0x118, 0x120, 0x128, 0x130, 0x138, 0x140,
+        0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x180, 0x190, 0x1A0, 0x1B0, 0x1C0,
+        0x1D0, 0x1E0, 0x1F0, 0x200, 0x210, 0x220, 0x230, 0x240, 0x250, 0x260, 0x280,
+        0x2A0, 0x2C0, 0x2E0, 0x300, 0x320, 0x340, 0x360, 0x380, 0x3A0, 0x3C0, 0x3E0,
+        0x400, 0x420, 0x440, 0x460, 0x480, 0x4A0, 0x4C0, 0x500, 0x540, 0x580, 0x5C0
+    };
+    // Prefer a true AABB pair (min/max floats) if present
+    for (int off : kPosOff) {
+        float* f = reinterpret_cast<float*>(base + off);
+        float x0=f[0], y0=f[1], z0=f[2], x1=f[3], y1=f[4], z1=f[5];
+        if (looksLikeWorldPos(x0, y0, z0) && looksLikeWorldPos(x1, y1, z1) &&
+            x1 > x0 && y1 > y0 && z1 > z0 && (x1-x0) < 4.f && (y1-y0) < 4.f && (z1-z0) < 4.f &&
+            (y1-y0) > 0.5f) {
+            out = {x0, y0, z0, x1, y1, z1};
+            return true;
+        }
+    }
     for (int off : kPosOff) {
         float* f = reinterpret_cast<float*>(base + off);
         if (looksLikeWorldPos(f[0], f[1], f[2])) {
+            // Skip near-origin (inventory paper-doll / local space junk)
+            if (std::fabs(f[0]) < 8.f && std::fabs(f[2]) < 8.f && std::fabs(f[1]) < 8.f)
+                continue;
             float x = f[0], y = f[1], z = f[2];
-            out = {x - 0.35f, y, z - 0.35f, x + 0.35f, y + 1.85f, z + 0.35f};
+            out = {x - 0.4f, y, z - 0.4f, x + 0.4f, y + 1.9f, z + 0.4f};
             return true;
         }
     }
@@ -92,8 +112,18 @@ void noteActorEsp(void* actor) {
     if (!g_boxEsp.load(std::memory_order_relaxed) || !actor) return;
     Box b{};
     if (!probeActorBox(actor, b)) return;
+    // Drop inventory-local boxes (very small world coords near 0)
+    float cx = 0.5f * (b.minx + b.maxx);
+    float cz = 0.5f * (b.minz + b.maxz);
+    if (std::fabs(cx) < 8.f && std::fabs(cz) < 8.f) return;
+    static int s_boxLog = 0;
+    if (s_boxLog < 6) {
+        logLine("SnowChams: actor box (%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f)", b.minx, b.miny, b.minz, b.maxx, b.maxy,
+                b.maxz);
+        ++s_boxLog;
+    }
     std::lock_guard<std::mutex> lock(g_boxMu);
-    if (g_boxes.size() < 64)
+    if (g_boxes.size() < 96)
         g_boxes.push_back(b);
 }
 
@@ -336,13 +366,20 @@ bool looksLikeViewProj(const float* m) {
     if (!m) return false;
     for (int i = 0; i < 16; ++i)
         if (!std::isfinite(m[i])) return false;
+    // Reject identity
     bool id = true;
     for (int i = 0; i < 16; ++i) {
         float expect = (i % 5 == 0) ? 1.f : 0.f;
         if (std::fabs(m[i] - expect) > 1e-4f) { id = false; break; }
     }
     if (id) return false;
-    return (std::fabs(m[11]) + std::fabs(m[14]) + std::fabs(m[15] - 1.f)) > 0.01f;
+    // Prefer real camera matrices: non-zero perspective row, finite w scale
+    float sumAbs = 0.f;
+    for (int i = 0; i < 16; ++i) sumAbs += std::fabs(m[i]);
+    if (sumAbs < 1.f || sumAbs > 1e6f) return false;
+    // m[11] often -1 for perspective (column-major viewproj)
+    if (std::fabs(m[11]) < 0.01f && std::fabs(m[14]) < 0.01f) return false;
+    return true;
 }
 
 void glUniformMatrix4fvDetour(int location, int count, unsigned char transpose, const float* value) {
@@ -661,11 +698,11 @@ void registerModule() {
         .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
-    b.config("r", "Red", pl::modmenu::ConfigType::SliderFloat, "0.88", "0", "1", "");
-    b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "0.95", "0", "1", "");
+    b.config("r", "Red", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
+    b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
-    b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.55", "0.05", "1.0", "");
-    b.config("intensity", "Intensity", pl::modmenu::ConfigType::SliderFloat, "1.35", "0.1", "2.5", "");
+    b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.70", "0.05", "1.0", "");
+    b.config("intensity", "Intensity", pl::modmenu::ConfigType::SliderFloat, "1.50", "0.1", "2.5", "");
     b.config("outlinePass", "Mesh multipass (experimental)", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("throughWalls", "Outline through walls", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("boxEsp", "White box ESP (entities)", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
