@@ -34,7 +34,7 @@ std::atomic<float> g_r{0.88f};
 std::atomic<float> g_g{0.95f};
 std::atomic<float> g_b{1.00f};
 std::atomic<float> g_opacity{0.55f};
-std::atomic<float> g_intensity{1.15f};
+std::atomic<float> g_intensity{1.35f};
 std::atomic_int g_hits{0};
 
 Color g_chams{0.88f, 0.95f, 1.00f, 0.55f};
@@ -114,16 +114,16 @@ void setEntityConstantsDetour(
     refresh();
     const Color* glint = glintColor;
     if (g_whiteOutline.load(std::memory_order_relaxed))
-        glint = &g_outline; // glowy white outline via glint channel
-    // Snow fill on overlay + change colors; white glint for edge glow
-    g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
+        glint = &g_outline;
+    // Wash entity/hand mesh: override light + overlay + change colors (stronger than overlay-only)
+    g_setEntityConstants(entityConstants, renderContext, &g_chams, tileLightColorUV, blockLightColor,
                          &g_chams, &g_chams, &g_chams, glint, glintUVScale, uvAnim, uvOffset1, uvOffset2,
                          uvRot1, uvRot2);
 
     const int n = g_hits.fetch_add(1, std::memory_order_relaxed);
-    if (n < 8)
-        logLine("HandChams: mesh #%d rgba=%.2f,%.2f,%.2f,%.2f outline=%d", n, g_chams.r, g_chams.g, g_chams.b,
-                g_chams.a, g_whiteOutline.load() ? 1 : 0);
+    if (n < 12)
+        logLine("SnowChams: entityConstants #%d rgba=%.2f,%.2f,%.2f,%.2f outline=%d", n, g_chams.r, g_chams.g,
+                g_chams.b, g_chams.a, g_whiteOutline.load() ? 1 : 0);
 }
 
 using SetupActorGlintFn = void (*)(
@@ -132,6 +132,31 @@ using SetupActorGlintFn = void (*)(
 
 SetupActorGlintFn g_setupActorGlint = nullptr;
 bool g_hookedActor = false;
+
+// Same layout as ActorGlint — used for non-actor / item glint setup (broader coverage)
+using SetupGlintFn = void (*)(
+    void*, void*, void*, const Color*, const Color*, const Color*, const Color*, float, float, float, float,
+    const void*);
+SetupGlintFn g_setupGlint = nullptr;
+bool g_hookedGlint = false;
+
+void setupGlintDetour(
+    void* screenContext, void* entityContext, void* actor, const Color* overlay, const Color* changeColor,
+    const Color* changeColor2, const Color* glintColor, float uvOffset1, float uvOffset2, float uvRot1,
+    float uvRot2, const void* lightEmissionColor) {
+    if (!g_setupGlint) return;
+    if (!shouldApply()) {
+        g_setupGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
+                     uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
+        return;
+    }
+    refresh();
+    const Color* glint = glintColor;
+    if (g_whiteOutline.load(std::memory_order_relaxed))
+        glint = &g_outline;
+    g_setupGlint(screenContext, entityContext, actor, &g_chams, &g_chams, &g_chams, glint, uvOffset1,
+                 uvOffset2, uvRot1, uvRot2, lightEmissionColor);
+}
 
 void setupActorGlintDetour(
     void* screenContext, void* entityContext, void* actor, const Color* overlay, const Color* changeColor,
@@ -192,8 +217,21 @@ void tryInstallHooks() {
             logLine("HandChams: setupActorGlint FAIL");
     }
 
-    logLine("HandChams: hooks fp=%d entity=%d actor=%d (mesh only, no 2D)", g_renderFpHooked ? 1 : 0,
-            g_hookedEntity ? 1 : 0, g_hookedActor ? 1 : 0);
+
+    if (!g_hookedGlint) {
+        o = nullptr;
+        if (bactro::memory::hook(bactro::memory::SignatureId::ActorShaderManagerSetupShaderParametersGlint,
+                                 reinterpret_cast<void*>(&setupGlintDetour), &o) &&
+            o) {
+            g_setupGlint = reinterpret_cast<SetupGlintFn>(o);
+            g_hookedGlint = true;
+            logLine("HandChams: setupGlint hooked");
+        } else
+            logLine("HandChams: setupGlint FAIL");
+    }
+
+    logLine("HandChams: hooks fp=%d entity=%d actor=%d glint=%d", g_renderFpHooked ? 1 : 0,
+            g_hookedEntity ? 1 : 0, g_hookedActor ? 1 : 0, g_hookedGlint ? 1 : 0);
 }
 
 void onToggle(std::string_view, bool enabled) {
@@ -228,8 +266,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Snow Chams");
     b.description(
-         "Snowy mesh chams + white glow outline on hand/items (and entities if Hand-only off). "
-         "Join world, then enable. If FP hook fails, still tints so you see the effect.")
+         "Snowy mesh chams on hand + entities/players (Hand-only off). White glint outline when supported. "
+         "F5/third-person to see your own body. Join world, then enable.")
         .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
@@ -237,7 +275,7 @@ void registerModule() {
     b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "0.95", "0", "1", "");
     b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.55", "0.05", "1.0", "");
-    b.config("intensity", "Intensity", pl::modmenu::ConfigType::SliderFloat, "1.15", "0.1", "2.5", "");
+    b.config("intensity", "Intensity", pl::modmenu::ConfigType::SliderFloat, "1.35", "0.1", "2.5", "");
     b.config("whiteOutline", "White glow outline", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("handOnly", "Hand/items only", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.registerModule();
