@@ -61,6 +61,8 @@ std::atomic_bool g_vpValid{false};
 std::atomic_bool g_boxEsp{true};
 std::atomic<float> g_lineWidth{2.5f};
 
+void logLine(const char* fmt, ...);
+
 bool finite3(float x, float y, float z) {
     return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
 }
