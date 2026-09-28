@@ -1,8 +1,6 @@
 #include "bactro/Signatures.hpp"
 #include "bactro/MotionBlur.hpp"
 #include "bactro/HandChams.hpp"
-#include "bactro/WireOutline.hpp"
-#include "bactro/TargetHUD.hpp"
 #include "bactro/Status.hpp"
 #include "Version.hpp"
 
@@ -186,8 +184,6 @@ void resolveEverythingAsync() {
         installTickHook();
                 bactro::motionblur::onSignaturesReady();
                         bactro::handchams::onSignaturesReady();
-        bactro::wireoutline::onSignaturesReady();
-        bactro::targethud::onSignaturesReady();
                 writeStatus("async init finished");
     }).detach();
 }
@@ -243,8 +239,6 @@ void registerMenus() {
     }
     bactro::motionblur::registerModule();
     bactro::handchams::registerModule();
-    bactro::wireoutline::registerModule();
-    bactro::targethud::registerModule();
 }
 
 } // namespace
@@ -271,7 +265,7 @@ public:
         installSwapIntervalHook();
         resolveEverythingAsync();
         g_perfEnabled.store(true, std::memory_order_release);
-        LOGI("BactroNative enabled (Phase Outline 1.7.0)");
+        LOGI("BactroNative enabled (Snow Chams)");
         writeStatus("enabled");
         return true;
     }
@@ -280,8 +274,6 @@ public:
         onPerfToggle("", false);
                 bactro::motionblur::shutdown();
                                 bactro::handchams::shutdown();
-        bactro::wireoutline::shutdown();
-        bactro::targethud::shutdown();
         return true;
     }
 
@@ -289,8 +281,6 @@ public:
         onPerfToggle("", false);
                 bactro::motionblur::shutdown();
                                 bactro::handchams::shutdown();
-        bactro::wireoutline::shutdown();
-        bactro::targethud::shutdown();
         return true;
     }
 };

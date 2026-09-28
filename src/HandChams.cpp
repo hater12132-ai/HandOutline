@@ -27,16 +27,20 @@ struct Color {
 constexpr const char* kModuleId = "bactro.handchams";
 
 std::atomic_bool g_enabled{false};
-std::atomic_bool g_handOnly{true}; // default: hand/items only (stable)
-// Snowy palette (ice / fresh snow) — matches translucent look of popular chams
-std::atomic<float> g_r{0.82f};
-std::atomic<float> g_g{0.94f};
+std::atomic_bool g_handOnly{false}; // default OFF = hand + entities/players
+std::atomic_bool g_whiteOutline{true};
+// Snowy palette (ice / fresh snow)
+std::atomic<float> g_r{0.88f};
+std::atomic<float> g_g{0.95f};
 std::atomic<float> g_b{1.00f};
-std::atomic<float> g_opacity{0.45f}; // same ballpark as pink chams in the clip
-std::atomic<float> g_intensity{1.0f};
+std::atomic<float> g_opacity{0.55f};
+std::atomic<float> g_intensity{1.15f};
 std::atomic_int g_hits{0};
 
-Color g_chams{0.82f, 0.94f, 1.00f, 0.45f};
+Color g_chams{0.88f, 0.95f, 1.00f, 0.55f};
+Color g_outline{1.00f, 1.00f, 1.00f, 0.95f}; // glowy white outline / glint
+
+bool g_renderFpHooked = false; // used by shouldApply before tryInstallHooks
 
 void logLine(const char* fmt, ...) {
     char buf[192];
@@ -50,9 +54,7 @@ void logLine(const char* fmt, ...) {
 
 void refresh() {
     const float i = g_intensity.load(std::memory_order_relaxed);
-    const float a = g_opacity.load(std::memory_order_relaxed);
-    // Clamp so engine never gets garbage alpha
-    float aa = a;
+    float aa = g_opacity.load(std::memory_order_relaxed);
     if (aa < 0.05f) aa = 0.05f;
     if (aa > 1.0f) aa = 1.0f;
     g_chams = {
@@ -61,19 +63,25 @@ void refresh() {
         g_b.load(std::memory_order_relaxed) * i,
         aa,
     };
+    // pure white glow edge
+    g_outline = {1.0f, 1.0f, 1.0f, 0.95f};
 }
 
 bool shouldApply() {
     if (!g_enabled.load(std::memory_order_relaxed)) return false;
-    if (g_handOnly.load(std::memory_order_relaxed))
-        return bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
-    return true;
+    // Hand/items only: prefer FP-hand phase when that hook works.
+    // If renderFirstPerson never hooked, still apply so hand/items get snowy tint.
+    if (g_handOnly.load(std::memory_order_relaxed)) {
+        if (g_renderFpHooked)
+            return bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
+        return true; // fallback — otherwise chams never fire
+    }
+    return true; // all entities
 }
 
 // ---- FP hand: set flag so item/hand draws get chams (NO extra 2D draw) ----
 using RenderFirstPersonFn = void (*)(void*, void*, void*, void*, void*, void*);
 RenderFirstPersonFn g_renderFpOriginal = nullptr;
-bool g_renderFpHooked = false;
 
 void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5) {
     if (!g_renderFpOriginal) return;
@@ -104,14 +112,18 @@ void setEntityConstantsDetour(
     }
 
     refresh();
-    // Solid mesh chams — same path that colored your pickaxe/hand while swinging
+    const Color* glint = glintColor;
+    if (g_whiteOutline.load(std::memory_order_relaxed))
+        glint = &g_outline; // glowy white outline via glint channel
+    // Snow fill on overlay + change colors; white glint for edge glow
     g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
-                         &g_chams, &g_chams, &g_chams, glintColor, glintUVScale, uvAnim, uvOffset1, uvOffset2,
+                         &g_chams, &g_chams, &g_chams, glint, glintUVScale, uvAnim, uvOffset1, uvOffset2,
                          uvRot1, uvRot2);
 
     const int n = g_hits.fetch_add(1, std::memory_order_relaxed);
     if (n < 8)
-        logLine("HandChams: mesh #%d rgba=%.2f,%.2f,%.2f,%.2f", n, g_chams.r, g_chams.g, g_chams.b, g_chams.a);
+        logLine("HandChams: mesh #%d rgba=%.2f,%.2f,%.2f,%.2f outline=%d", n, g_chams.r, g_chams.g, g_chams.b,
+                g_chams.a, g_whiteOutline.load() ? 1 : 0);
 }
 
 using SetupActorGlintFn = void (*)(
@@ -134,7 +146,10 @@ void setupActorGlintDetour(
     }
 
     refresh();
-    g_setupActorGlint(screenContext, entityContext, actor, &g_chams, &g_chams, &g_chams, glintColor, uvOffset1,
+    const Color* glint = glintColor;
+    if (g_whiteOutline.load(std::memory_order_relaxed))
+        glint = &g_outline;
+    g_setupActorGlint(screenContext, entityContext, actor, &g_chams, &g_chams, &g_chams, glint, uvOffset1,
                       uvOffset2, uvRot1, uvRot2, lightEmissionColor);
 }
 
@@ -201,6 +216,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_intensity.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "handOnly")
             g_handOnly.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "whiteOutline")
+            g_whiteOutline.store(value == "true" || value == "1", std::memory_order_relaxed);
         refresh();
     } catch (...) {
     }
@@ -209,20 +226,20 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 } // namespace
 
 void registerModule() {
-    pl::modmenu::ModuleBuilder b(kModuleId, "Hand Chams");
+    pl::modmenu::ModuleBuilder b(kModuleId, "Snow Chams");
     b.description(
-         "Snowy translucent mesh chams on hand & held items (swing-aware). "
-         "Default ice/snow tint + ~0.45 opacity like popular glow chams. Join world, then enable.")
+         "Snowy mesh chams + white glow outline on hand/items (and entities if Hand-only off). "
+         "Join world, then enable. If FP hook fails, still tints so you see the effect.")
         .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
-    // Snow defaults
-    b.config("r", "Red", pl::modmenu::ConfigType::SliderFloat, "0.82", "0", "1", "");
-    b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "0.94", "0", "1", "");
+    b.config("r", "Red", pl::modmenu::ConfigType::SliderFloat, "0.88", "0", "1", "");
+    b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "0.95", "0", "1", "");
     b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
-    b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.45", "0.05", "1.0", "");
-    b.config("intensity", "Intensity", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.1", "2.0", "");
-    b.config("handOnly", "Hand/items only", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.55", "0.05", "1.0", "");
+    b.config("intensity", "Intensity", pl::modmenu::ConfigType::SliderFloat, "1.15", "0.1", "2.5", "");
+    b.config("whiteOutline", "White glow outline", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("handOnly", "Hand/items only", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.registerModule();
 }
 
