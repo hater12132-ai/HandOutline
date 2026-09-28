@@ -15,6 +15,9 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <mutex>
+#include <vector>
+#include <cmath>
 
 #define HC_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "BactroNative", __VA_ARGS__)
 
@@ -29,7 +32,7 @@ constexpr const char* kModuleId = "bactro.handchams";
 
 std::atomic_bool g_enabled{false};
 std::atomic_bool g_handOnly{false};
-std::atomic_bool g_outlinePass{true}; // multi-pass inverted-cull outline
+std::atomic_bool g_outlinePass{false}; // mesh multipass — weak on MC models; use box ESP
 std::atomic_bool g_throughWalls{false};
 std::atomic<float> g_r{0.88f};
 std::atomic<float> g_g{0.95f};
@@ -45,6 +48,55 @@ Color g_outline{1.00f, 1.00f, 1.00f, 1.00f};
 bool g_renderFpHooked = false;
 std::atomic_bool g_meshChamsArmed{false}; // setEntityConstants saw a chams-eligible draw
 std::atomic_int g_pass{0}; // 0=normal, 1=outline, 2=fill
+
+// ---- White AABB ESP (visible outline around entities) ----
+struct Box {
+    float minx, miny, minz, maxx, maxy, maxz;
+};
+std::mutex g_boxMu;
+std::vector<Box> g_boxes;
+std::mutex g_vpMu;
+float g_viewProj[16]{};
+std::atomic_bool g_vpValid{false};
+std::atomic_bool g_boxEsp{true};
+std::atomic<float> g_lineWidth{2.5f};
+
+bool finite3(float x, float y, float z) {
+    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+bool looksLikeWorldPos(float x, float y, float z) {
+    if (!finite3(x, y, z)) return false;
+    if (std::fabs(x) > 300000.f || std::fabs(z) > 300000.f) return false;
+    if (y < -80.f || y > 400.f) return false;
+    if (std::fabs(x) < 1e-3f && std::fabs(y) < 1e-3f && std::fabs(z) < 1e-3f) return false;
+    return true;
+}
+bool probeActorBox(void* actor, Box& out) {
+    if (!actor) return false;
+    auto* base = reinterpret_cast<unsigned char*>(actor);
+    static const int kPosOff[] = {0x48, 0x50, 0x68, 0x70, 0x88, 0x90, 0xA0, 0xB0, 0xC8, 0xD0,
+                                  0x100, 0x108, 0x120, 0x128, 0x148, 0x150, 0x168, 0x190,
+                                  0x1A0, 0x1C0, 0x1E0, 0x200, 0x220, 0x240, 0x280, 0x2A0,
+                                  0x2C0, 0x300, 0x340, 0x380, 0x3C0, 0x400};
+    for (int off : kPosOff) {
+        float* f = reinterpret_cast<float*>(base + off);
+        if (looksLikeWorldPos(f[0], f[1], f[2])) {
+            float x = f[0], y = f[1], z = f[2];
+            out = {x - 0.35f, y, z - 0.35f, x + 0.35f, y + 1.85f, z + 0.35f};
+            return true;
+        }
+    }
+    return false;
+}
+void noteActorEsp(void* actor) {
+    if (!g_boxEsp.load(std::memory_order_relaxed) || !actor) return;
+    Box b{};
+    if (!probeActorBox(actor, b)) return;
+    std::lock_guard<std::mutex> lock(g_boxMu);
+    if (g_boxes.size() < 64)
+        g_boxes.push_back(b);
+}
+
 
 void logLine(const char* fmt, ...) {
     char buf[220];
@@ -199,6 +251,8 @@ void setupActorGlintDetour(
     const Color* changeColor2, const Color* glintColor, float uvOffset1, float uvOffset2, float uvRot1,
     float uvRot2, const void* lightEmissionColor) {
     if (!g_setupActorGlint) return;
+    if (g_enabled.load(std::memory_order_relaxed))
+        noteActorEsp(actor);
     if (!shouldApply()) {
         g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
                           uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
@@ -272,9 +326,225 @@ void renderMeshDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5
         logLine("SnowChams: multipass mesh #%d", n);
 }
 
+
+// ---- View-projection capture for box ESP ----
+using PFN_glUniformMatrix4fv = void (*)(int, int, unsigned char, const float*);
+PFN_glUniformMatrix4fv g_glUniformMatrix4fvOrig = nullptr;
+bool g_glUniformHooked = false;
+
+bool looksLikeViewProj(const float* m) {
+    if (!m) return false;
+    for (int i = 0; i < 16; ++i)
+        if (!std::isfinite(m[i])) return false;
+    bool id = true;
+    for (int i = 0; i < 16; ++i) {
+        float expect = (i % 5 == 0) ? 1.f : 0.f;
+        if (std::fabs(m[i] - expect) > 1e-4f) { id = false; break; }
+    }
+    if (id) return false;
+    return (std::fabs(m[11]) + std::fabs(m[14]) + std::fabs(m[15] - 1.f)) > 0.01f;
+}
+
+void glUniformMatrix4fvDetour(int location, int count, unsigned char transpose, const float* value) {
+    if (value && count >= 1 && looksLikeViewProj(value)) {
+        std::lock_guard<std::mutex> lock(g_vpMu);
+        if (transpose) {
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c)
+                    g_viewProj[c * 4 + r] = value[r * 4 + c];
+        } else {
+            std::memcpy(g_viewProj, value, 16 * sizeof(float));
+        }
+        g_vpValid.store(true, std::memory_order_release);
+    }
+    if (g_glUniformMatrix4fvOrig)
+        g_glUniformMatrix4fvOrig(location, count, transpose, value);
+}
+
+bool installVpHook() {
+    if (g_glUniformHooked) return true;
+    void* target = glProc("glUniformMatrix4fv");
+    if (!target) {
+        logLine("SnowChams: glUniformMatrix4fv not found");
+        return false;
+    }
+    void* o = nullptr;
+    if (pl::memory::hook(target, reinterpret_cast<void*>(&glUniformMatrix4fvDetour), &o) == 0 && o) {
+        g_glUniformMatrix4fvOrig = reinterpret_cast<PFN_glUniformMatrix4fv>(o);
+        g_glUniformHooked = true;
+        logLine("SnowChams: VP capture HOOKED");
+        return true;
+    }
+    logLine("SnowChams: VP capture FAIL");
+    return false;
+}
+
+bool worldToNdc(const float* vp, float x, float y, float z, float& ox, float& oy) {
+    float clipX = vp[0]*x + vp[4]*y + vp[8]*z + vp[12];
+    float clipY = vp[1]*x + vp[5]*y + vp[9]*z + vp[13];
+    float clipW = vp[3]*x + vp[7]*y + vp[11]*z + vp[15];
+    if (std::fabs(clipW) < 1e-5f) return false;
+    ox = clipX / clipW;
+    oy = clipY / clipW;
+    return std::isfinite(ox) && std::isfinite(oy) && ox > -2.f && ox < 2.f && oy > -2.f && oy < 2.f;
+}
+
+// Minimal line shader for NDC boxes
+using GLuint = unsigned int;
+using GLint = int;
+using GLenum = unsigned int;
+using GLsizei = int;
+using GLfloat = float;
+using GLchar = char;
+constexpr GLenum GL_VERTEX_SHADER = 0x8B31;
+constexpr GLenum GL_FRAGMENT_SHADER = 0x8B30;
+constexpr GLenum GL_COMPILE_STATUS = 0x8B81;
+constexpr GLenum GL_LINK_STATUS = 0x8B82;
+constexpr GLenum GL_ARRAY_BUFFER = 0x8892;
+constexpr GLenum GL_FLOAT = 0x1406;
+constexpr GLenum GL_LINES = 0x0001;
+constexpr GLenum GL_BLEND = 0x0BE2;
+constexpr GLenum GL_SRC_ALPHA = 0x0302;
+constexpr GLenum GL_ONE_MINUS_SRC_ALPHA = 0x0303;
+
+using PFN_glCreateShader = GLuint (*)(GLenum);
+using PFN_glShaderSource = void (*)(GLuint, GLsizei, const GLchar* const*, const GLint*);
+using PFN_glCompileShader = void (*)(GLuint);
+using PFN_glGetShaderiv = void (*)(GLuint, GLenum, GLint*);
+using PFN_glCreateProgram = GLuint (*)(void);
+using PFN_glAttachShader = void (*)(GLuint, GLuint);
+using PFN_glLinkProgram = void (*)(GLuint);
+using PFN_glGetProgramiv = void (*)(GLuint, GLenum, GLint*);
+using PFN_glUseProgram = void (*)(GLuint);
+using PFN_glGetAttribLocation = GLint (*)(GLuint, const GLchar*);
+using PFN_glGetUniformLocation = GLint (*)(GLuint, const GLchar*);
+using PFN_glUniform4f = void (*)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
+using PFN_glGenBuffers = void (*)(GLsizei, GLuint*);
+using PFN_glBindBuffer = void (*)(GLenum, GLuint);
+using PFN_glBufferData = void (*)(GLenum, long, const void*, GLenum);
+using PFN_glEnableVertexAttribArray = void (*)(GLuint);
+using PFN_glVertexAttribPointer = void (*)(GLuint, GLint, GLenum, unsigned char, GLsizei, const void*);
+using PFN_glDrawArrays = void (*)(GLenum, GLint, GLsizei);
+using PFN_glBlendFunc = void (*)(GLenum, GLenum);
+using PFN_glLineWidth = void (*)(GLfloat);
+
+PFN_glCreateShader d_glCreateShader = nullptr;
+PFN_glShaderSource d_glShaderSource = nullptr;
+PFN_glCompileShader d_glCompileShader = nullptr;
+PFN_glGetShaderiv d_glGetShaderiv = nullptr;
+PFN_glCreateProgram d_glCreateProgram = nullptr;
+PFN_glAttachShader d_glAttachShader = nullptr;
+PFN_glLinkProgram d_glLinkProgram = nullptr;
+PFN_glGetProgramiv d_glGetProgramiv = nullptr;
+PFN_glUseProgram d_glUseProgram = nullptr;
+PFN_glGetAttribLocation d_glGetAttribLocation = nullptr;
+PFN_glGetUniformLocation d_glGetUniformLocation = nullptr;
+PFN_glUniform4f d_glUniform4f = nullptr;
+PFN_glGenBuffers d_glGenBuffers = nullptr;
+PFN_glBindBuffer d_glBindBuffer = nullptr;
+PFN_glBufferData d_glBufferData = nullptr;
+PFN_glEnableVertexAttribArray d_glEnableVertexAttribArray = nullptr;
+PFN_glVertexAttribPointer d_glVertexAttribPointer = nullptr;
+PFN_glDrawArrays d_glDrawArrays = nullptr;
+PFN_glBlendFunc d_glBlendFunc = nullptr;
+PFN_glLineWidth d_glLineWidth = nullptr;
+
+GLuint g_prog = 0, g_vbo = 0;
+GLint g_aPos = -1, g_uColor = -1;
+bool g_lineGlReady = false;
+
+bool loadLineGl() {
+    if (g_lineGlReady) return true;
+#define L(name) d_##name = reinterpret_cast<decltype(d_##name)>(glProc(#name))
+    L(glCreateShader); L(glShaderSource); L(glCompileShader); L(glGetShaderiv);
+    L(glCreateProgram); L(glAttachShader); L(glLinkProgram); L(glGetProgramiv);
+    L(glUseProgram); L(glGetAttribLocation); L(glGetUniformLocation); L(glUniform4f);
+    L(glGenBuffers); L(glBindBuffer); L(glBufferData);
+    L(glEnableVertexAttribArray); L(glVertexAttribPointer); L(glDrawArrays);
+    L(glBlendFunc); L(glLineWidth);
+#undef L
+    if (!d_glCreateShader || !d_glCreateProgram || !d_glDrawArrays) return false;
+    const char* vs =
+        "attribute vec2 aPos; void main(){ gl_Position = vec4(aPos, 0.0, 1.0); }";
+    const char* fs =
+        "precision mediump float; uniform vec4 uColor; void main(){ gl_FragColor = uColor; }";
+    GLuint v = d_glCreateShader(GL_VERTEX_SHADER);
+    GLuint f = d_glCreateShader(GL_FRAGMENT_SHADER);
+    d_glShaderSource(v, 1, &vs, nullptr);
+    d_glCompileShader(v);
+    d_glShaderSource(f, 1, &fs, nullptr);
+    d_glCompileShader(f);
+    g_prog = d_glCreateProgram();
+    d_glAttachShader(g_prog, v);
+    d_glAttachShader(g_prog, f);
+    d_glLinkProgram(g_prog);
+    g_aPos = d_glGetAttribLocation(g_prog, "aPos");
+    g_uColor = d_glGetUniformLocation(g_prog, "uColor");
+    d_glGenBuffers(1, &g_vbo);
+    g_lineGlReady = g_prog != 0;
+    if (g_lineGlReady) logLine("SnowChams: box ESP line shader OK");
+    return g_lineGlReady;
+}
+
+void drawBoxEsp() {
+    if (!g_boxEsp.load(std::memory_order_relaxed)) return;
+    if (!g_vpValid.load(std::memory_order_acquire)) return;
+    std::vector<Box> boxes;
+    {
+        std::lock_guard<std::mutex> lock(g_boxMu);
+        boxes.swap(g_boxes);
+    }
+    if (boxes.empty()) return;
+    float vp[16];
+    {
+        std::lock_guard<std::mutex> lock(g_vpMu);
+        std::memcpy(vp, g_viewProj, sizeof(vp));
+    }
+    std::vector<float> lines;
+    lines.reserve(boxes.size() * 48);
+    for (const auto& b : boxes) {
+        float c[8][3] = {
+            {b.minx, b.miny, b.minz}, {b.maxx, b.miny, b.minz}, {b.maxx, b.maxy, b.minz}, {b.minx, b.maxy, b.minz},
+            {b.minx, b.miny, b.maxz}, {b.maxx, b.miny, b.maxz}, {b.maxx, b.maxy, b.maxz}, {b.minx, b.maxy, b.maxz},
+        };
+        float s[8][2];
+        bool ok[8];
+        for (int i = 0; i < 8; ++i)
+            ok[i] = worldToNdc(vp, c[i][0], c[i][1], c[i][2], s[i][0], s[i][1]);
+        const int edges[12][2] = {{0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}};
+        for (auto& e : edges) {
+            if (ok[e[0]] && ok[e[1]]) {
+                lines.push_back(s[e[0]][0]); lines.push_back(s[e[0]][1]);
+                lines.push_back(s[e[1]][0]); lines.push_back(s[e[1]][1]);
+            }
+        }
+    }
+    if (lines.empty()) return;
+    if (!loadLineGl()) return;
+    if (p_glDisable) p_glDisable(GL_DEPTH_TEST);
+    if (p_glEnable) p_glEnable(GL_BLEND);
+    if (d_glBlendFunc) d_glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    if (d_glLineWidth) d_glLineWidth(g_lineWidth.load());
+    d_glUseProgram(g_prog);
+    if (d_glUniform4f && g_uColor >= 0)
+        d_glUniform4f(g_uColor, 1.f, 1.f, 1.f, 0.95f);
+    d_glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    d_glBufferData(GL_ARRAY_BUFFER, (long)(lines.size() * sizeof(float)), lines.data(), 0x88E4);
+    d_glEnableVertexAttribArray((GLuint)g_aPos);
+    d_glVertexAttribPointer((GLuint)g_aPos, 2, GL_FLOAT, 0, 0, nullptr);
+    d_glDrawArrays(GL_LINES, 0, (GLsizei)(lines.size() / 2));
+    d_glUseProgram(0);
+    static int s_log = 0;
+    if (s_log < 8) {
+        logLine("SnowChams: box ESP drew %d segs (%d actors)", (int)(lines.size()/4), (int)boxes.size());
+        ++s_log;
+    }
+}
+
 void tryInstallHooks() {
     void* o = nullptr;
     resolveGl();
+    installVpHook();
 
     if (!g_renderFpHooked) {
         o = nullptr;
@@ -374,6 +644,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_outlinePass.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "throughWalls")
             g_throughWalls.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "boxEsp")
+            g_boxEsp.store(value == "true" || value == "1", std::memory_order_relaxed);
         refresh();
     } catch (...) {
     }
@@ -384,8 +656,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Snow Chams ESP");
     b.description(
-         "Multi-pass snowy chams + white inverted-cull outline on hand/entities. "
-         "Outline needs MeshHelpers hook. F5 to see own body. Join world, then enable.")
+         "Snowy hand/entity chams + white AABB box ESP on rendered actors. "
+         "Box ESP is the visible outline (mesh multipass is off by default). Join world, enable.")
         .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
@@ -394,8 +666,9 @@ void registerModule() {
     b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.55", "0.05", "1.0", "");
     b.config("intensity", "Intensity", pl::modmenu::ConfigType::SliderFloat, "1.35", "0.1", "2.5", "");
-    b.config("outlinePass", "Multi-pass outline", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("outlinePass", "Mesh multipass (experimental)", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("throughWalls", "Outline through walls", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("boxEsp", "White box ESP (entities)", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("handOnly", "Hand/items only", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.registerModule();
 }
@@ -406,6 +679,9 @@ void onSignaturesReady() {
 
 void shutdown() { g_enabled.store(false, std::memory_order_release); }
 
-void onPostFrame() {}
+void onPostFrame() {
+    if (!g_enabled.load(std::memory_order_relaxed)) return;
+    drawBoxEsp();
+}
 
 } // namespace bactro::handchams
