@@ -90,9 +90,10 @@ bool probeActorBox(void* actor, Box& out) {
     for (int off : kPosOff) {
         float* f = reinterpret_cast<float*>(base + off);
         float x0=f[0], y0=f[1], z0=f[2], x1=f[3], y1=f[4], z1=f[5];
+        // Need real volume — (145,82,-29)-(145,84,-29) was accepted before and became a white dot
         if (looksLikeWorldPos(x0, y0, z0) && looksLikeWorldPos(x1, y1, z1) &&
-            x1 > x0 && y1 > y0 && z1 > z0 && (x1-x0) < 4.f && (y1-y0) < 4.f && (z1-z0) < 4.f &&
-            (y1-y0) > 0.5f) {
+            x1 > x0 + 0.15f && y1 > y0 + 0.5f && z1 > z0 + 0.15f &&
+            (x1 - x0) < 5.f && (y1 - y0) < 5.f && (z1 - z0) < 5.f) {
             out = {x0, y0, z0, x1, y1, z1};
             return true;
         }
@@ -283,12 +284,30 @@ void setupActorGlintDetour(
     const Color* changeColor2, const Color* glintColor, float uvOffset1, float uvOffset2, float uvRot1,
     float uvRot2, const void* lightEmissionColor) {
     if (!g_setupActorGlint) return;
-    if (g_enabled.load(std::memory_order_relaxed))
-        noteActorEsp(actor);
+    bool worldActor = false;
+    if (g_enabled.load(std::memory_order_relaxed) && actor) {
+        Box tb{};
+        if (probeActorBox(actor, tb)) {
+            float cx = 0.5f * (tb.minx + tb.maxx);
+            float cz = 0.5f * (tb.minz + tb.maxz);
+            worldActor = !(std::fabs(cx) < 8.f && std::fabs(cz) < 8.f);
+            if (worldActor)
+                noteActorEsp(actor);
+        }
+    }
     if (!shouldApply()) {
         g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
                           uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
         return;
+    }
+    // Paper-doll / inventory actor: we probed a near-origin box → leave vanilla
+    if (actor && !worldActor) {
+        Box chk{};
+        if (probeActorBox(actor, chk)) {
+            g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
+                              uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
+            return;
+        }
     }
     refresh();
     g_meshChamsArmed.store(true, std::memory_order_release);
@@ -419,13 +438,20 @@ bool installVpHook() {
 }
 
 bool worldToNdc(const float* vp, float x, float y, float z, float& ox, float& oy) {
+    // column-major MVP * vec4(x,y,z,1)
     float clipX = vp[0]*x + vp[4]*y + vp[8]*z + vp[12];
     float clipY = vp[1]*x + vp[5]*y + vp[9]*z + vp[13];
     float clipW = vp[3]*x + vp[7]*y + vp[11]*z + vp[15];
-    if (std::fabs(clipW) < 1e-5f) return false;
+    if (std::fabs(clipW) < 1e-4f) {
+        // try row-major interpretation
+        clipX = vp[0]*x + vp[1]*y + vp[2]*z + vp[3];
+        clipY = vp[4]*x + vp[5]*y + vp[6]*z + vp[7];
+        clipW = vp[12]*x + vp[13]*y + vp[14]*z + vp[15];
+    }
+    if (std::fabs(clipW) < 1e-4f) return false;
     ox = clipX / clipW;
     oy = clipY / clipW;
-    return std::isfinite(ox) && std::isfinite(oy) && ox > -2.f && ox < 2.f && oy > -2.f && oy < 2.f;
+    return std::isfinite(ox) && std::isfinite(oy) && ox > -1.5f && ox < 1.5f && oy > -1.5f && oy < 1.5f;
 }
 
 // Minimal line shader for NDC boxes
@@ -559,6 +585,20 @@ void drawBoxEsp() {
         }
     }
     if (lines.empty()) return;
+    // Reject degenerate draw (everything collapsed → joystick white dot)
+    float minx=1e9f, maxx=-1e9f, miny=1e9f, maxy=-1e9f;
+    for (size_t i = 0; i + 1 < lines.size(); i += 2) {
+        minx = std::min(minx, lines[i]); maxx = std::max(maxx, lines[i]);
+        miny = std::min(miny, lines[i+1]); maxy = std::max(maxy, lines[i+1]);
+    }
+    if ((maxx - minx) < 0.01f && (maxy - miny) < 0.01f) {
+        static int s_deg = 0;
+        if (s_deg < 4) {
+            logLine("SnowChams: box ESP degenerate (bad VP/AABB) skip");
+            ++s_deg;
+        }
+        return;
+    }
     if (!loadLineGl()) return;
     if (p_glDisable) p_glDisable(GL_DEPTH_TEST);
     if (p_glEnable) p_glEnable(GL_BLEND);
@@ -714,6 +754,10 @@ void registerModule() {
 
 void onSignaturesReady() {
     logLine("SnowChams: ready — join world, then enable");
+    if (g_enabled.load(std::memory_order_relaxed)) {
+        logLine("SnowChams: was ON during resolve — installing hooks now");
+        tryInstallHooks();
+    }
 }
 
 void shutdown() { g_enabled.store(false, std::memory_order_release); }
