@@ -28,13 +28,15 @@ constexpr const char* kModuleId = "bactro.handchams";
 
 std::atomic_bool g_enabled{false};
 std::atomic_bool g_handOnly{true}; // default: hand/items only (stable)
-std::atomic<float> g_r{0.15f};
-std::atomic<float> g_g{0.85f};
+// Snowy palette (ice / fresh snow) — matches translucent look of popular chams
+std::atomic<float> g_r{0.82f};
+std::atomic<float> g_g{0.94f};
 std::atomic<float> g_b{1.00f};
+std::atomic<float> g_opacity{0.45f}; // same ballpark as pink chams in the clip
 std::atomic<float> g_intensity{1.0f};
 std::atomic_int g_hits{0};
 
-Color g_chams{0.15f, 0.85f, 1.00f, 1.0f};
+Color g_chams{0.82f, 0.94f, 1.00f, 0.45f};
 
 void logLine(const char* fmt, ...) {
     char buf[192];
@@ -48,11 +50,16 @@ void logLine(const char* fmt, ...) {
 
 void refresh() {
     const float i = g_intensity.load(std::memory_order_relaxed);
+    const float a = g_opacity.load(std::memory_order_relaxed);
+    // Clamp so engine never gets garbage alpha
+    float aa = a;
+    if (aa < 0.05f) aa = 0.05f;
+    if (aa > 1.0f) aa = 1.0f;
     g_chams = {
         g_r.load(std::memory_order_relaxed) * i,
         g_g.load(std::memory_order_relaxed) * i,
         g_b.load(std::memory_order_relaxed) * i,
-        1.0f,
+        aa,
     };
 }
 
@@ -104,7 +111,7 @@ void setEntityConstantsDetour(
 
     const int n = g_hits.fetch_add(1, std::memory_order_relaxed);
     if (n < 8)
-        logLine("HandChams: mesh #%d rgb=%.2f,%.2f,%.2f", n, g_chams.r, g_chams.g, g_chams.b);
+        logLine("HandChams: mesh #%d rgba=%.2f,%.2f,%.2f,%.2f", n, g_chams.r, g_chams.g, g_chams.b, g_chams.a);
 }
 
 using SetupActorGlintFn = void (*)(
@@ -188,6 +195,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_g.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "b")
             g_b.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        else if (key == "opacity")
+            g_opacity.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "intensity")
             g_intensity.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "handOnly")
@@ -202,14 +211,16 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Hand Chams");
     b.description(
-         "Solid mesh chams on hand & held items (moves with swing / item switch). "
-         "No 2D box, no Phase HUD card. Join world, then enable.")
+         "Snowy translucent mesh chams on hand & held items (swing-aware). "
+         "Default ice/snow tint + ~0.45 opacity like popular glow chams. Join world, then enable.")
         .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
-    b.config("r", "Red", pl::modmenu::ConfigType::SliderFloat, "0.15", "0", "1", "");
-    b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "0.85", "0", "1", "");
+    // Snow defaults
+    b.config("r", "Red", pl::modmenu::ConfigType::SliderFloat, "0.82", "0", "1", "");
+    b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "0.94", "0", "1", "");
     b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
+    b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.45", "0.05", "1.0", "");
     b.config("intensity", "Intensity", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.1", "2.0", "");
     b.config("handOnly", "Hand/items only", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.registerModule();
