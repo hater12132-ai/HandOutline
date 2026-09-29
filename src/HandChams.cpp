@@ -394,12 +394,13 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
                            const void* lightEmissionColor) {
     if (!g_setupActorGlint) return;
     static int s_ag = 0;
-    if (s_ag < 5) {
-        logLine("HandChams: setupActorGlint ENTER #%d", s_ag);
+    if (s_ag < 6) {
+        logLine("HandChams: setupActorGlint ENTER #%d en=%d", s_ag,
+                g_enabled.load(std::memory_order_relaxed) ? 1 : 0);
         ++s_ag;
     }
 
-    // Box ESP: arm matrix capture only for players when playersOnly, or any actor when not
+    // Box ESP arm (optional)
     if (g_enabled.load(std::memory_order_relaxed) && g_boxEsp.load(std::memory_order_relaxed) && actor) {
         bool ok = true;
         if (g_playersOnly.load(std::memory_order_relaxed) && g_isPlayer) {
@@ -410,15 +411,41 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
                 ok = false;
             }
         }
-        // Mobs: when playersOnly is false, accept all; when true, only players
-        // User asked mobs + players — so playersOnly false means both; we add mobs by not filtering
         if (ok) g_entityRenderArmed.store(true, std::memory_order_release);
     }
 
-    // NEVER recolor entity/cosmetic meshes here — cosmetics were getting washed, bodies not.
-    // Hand uses setEntityConstants + setupGlint in FP only.
-    g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
-                      uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
+    // Status proved setEntityConstants never runs — THIS is the live shader param path (Merci PassData-ish).
+    // Apply white fill + outline when module on. handOnly: still apply here (this path is what paints meshes).
+    if (!g_enabled.load(std::memory_order_relaxed)) {
+        g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
+                          uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
+        return;
+    }
+
+    refresh();
+    Color fill = g_chams;
+    Color edge = g_outline;
+    edge.a = 1.f;
+    auto poke = [](const Color* p, const Color& v) {
+        if (!p) return;
+        auto* w = const_cast<Color*>(p);
+        w->r = v.r;
+        w->g = v.g;
+        w->b = v.b;
+        w->a = v.a;
+    };
+    poke(overlay, fill);
+    poke(changeColor, fill);
+    poke(changeColor2, fill);
+    poke(glintColor, edge);
+
+    static int s_app = 0;
+    if (s_app < 8) {
+        logLine("HandChams: GLINT APPLY #%d fill=%.2f edge=1.0", s_app, fill.a);
+        ++s_app;
+    }
+    g_setupActorGlint(screenContext, entityContext, actor, &fill, &fill, &fill, &edge, uvOffset1, uvOffset2, uvRot1,
+                      uvRot2, lightEmissionColor);
 }
 
 void setupGlintDetour(void* screenContext, void* entityContext, void* actor, const Color* overlay,
@@ -430,19 +457,12 @@ void setupGlintDetour(void* screenContext, void* entityContext, void* actor, con
                      uvOffset2, uvRot1, uvRot2, lightEmissionColor);
         return;
     }
-    const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
-    const bool handMode = g_handOnly.load(std::memory_order_relaxed);
-    if (!handMode && !fp) {
-        g_setupGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor, uvOffset1,
-                     uvOffset2, uvRot1, uvRot2, lightEmissionColor);
-        return;
-    }
     refresh();
     Color fill = g_chams;
     Color edge = g_outline;
     edge.a = 1.f;
-    g_setupGlint(screenContext, entityContext, actor, &fill, changeColor, changeColor2, &edge, uvOffset1, uvOffset2,
-                 uvRot1, uvRot2, lightEmissionColor);
+    g_setupGlint(screenContext, entityContext, actor, &fill, &fill, &fill, &edge, uvOffset1, uvOffset2, uvRot1,
+                 uvRot2, lightEmissionColor);
 }
 
 
