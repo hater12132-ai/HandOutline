@@ -121,7 +121,9 @@ bool looksLikeModelMatrix(const float* m, float& tx, float& ty, float& tz) {
     ty = m[13];
     tz = m[14];
     if (!std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(tz)) return false;
-    if (std::fabs(tx) < 2.f && std::fabs(tz) < 2.f && std::fabs(ty) < 3.f) return false;
+    // Reject bone/local matrices like (0,12,0) / inventory — need real world XZ
+    float xz = std::sqrt(tx * tx + tz * tz);
+    if (xz < 16.f) return false;
     if (std::fabs(tx) > 300000.f || std::fabs(tz) > 300000.f) return false;
     if (ty < -80.f || ty > 500.f) return false;
     float sx = std::fabs(m[0]) + std::fabs(m[1]) + std::fabs(m[2]);
@@ -130,6 +132,33 @@ bool looksLikeModelMatrix(const float* m, float& tx, float& ty, float& tz) {
     if (sx < 0.2f || sy < 0.2f || sz < 0.2f) return false;
     if (sx > 20.f || sy > 20.f || sz > 20.f) return false;
     return true;
+}
+
+// Actor memory: find a world position (not AABB pair — those were degenerate)
+bool probeActorWorldPos(void* actor, float& x, float& y, float& z) {
+    if (!actor) return false;
+    auto* base = reinterpret_cast<unsigned char*>(actor);
+    static const int kOff[] = {
+        0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xA0,
+        0xA8, 0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xE0, 0xF0, 0x100, 0x110, 0x120, 0x128, 0x130, 0x140, 0x148,
+        0x150, 0x160, 0x168, 0x180, 0x190, 0x1A0, 0x1C0, 0x1E0, 0x200, 0x220, 0x240, 0x260, 0x280, 0x2A0,
+        0x2C0, 0x300, 0x340, 0x380, 0x3C0, 0x400, 0x440, 0x480, 0x4C0, 0x500, 0x540, 0x580
+    };
+    for (int off : kOff) {
+        float* f = reinterpret_cast<float*>(base + off);
+        float px = f[0], py = f[1], pz = f[2];
+        if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz)) continue;
+        float xz = std::sqrt(px * px + pz * pz);
+        // world-like: away from origin XZ, reasonable Y
+        if (xz < 16.f) continue;
+        if (std::fabs(px) > 300000.f || std::fabs(pz) > 300000.f) continue;
+        if (py < -64.f || py > 400.f) continue;
+        x = px;
+        y = py;
+        z = pz;
+        return true;
+    }
+    return false;
 }
 
 void noteWorldBox(float x, float y, float z) {
@@ -383,7 +412,22 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
                               const void* glintUVScale, const void* uvAnim, float uvOffset1, float uvOffset2,
                               float uvRot1, float uvRot2) {
     if (!g_setEntityConstants) return;
-    if (!shouldApply()) {
+    // Hand path only for setEntityConstants (avoids inventory paper-doll wash)
+    const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
+    if (!g_enabled.load(std::memory_order_relaxed) || (!fp && g_handOnly.load(std::memory_order_relaxed))) {
+        g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
+                             overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
+                             uvOffset2, uvRot1, uvRot2);
+        return;
+    }
+    if (!fp && !shouldApply()) {
+        g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
+                             overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
+                             uvOffset2, uvRot1, uvRot2);
+        return;
+    }
+    // Prefer FP hand for this hook; entity bodies use setupActorGlint(worldActor)
+    if (!fp) {
         g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
                              overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
                              uvOffset2, uvRot1, uvRot2);
@@ -405,7 +449,20 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
                            float uvOffset1, float uvOffset2, float uvRot1, float uvRot2,
                            const void* lightEmissionColor) {
     if (!g_setupActorGlint) return;
-    if (!shouldApply()) {
+
+    float ax = 0, ay = 0, az = 0;
+    const bool worldActor = actor && probeActorWorldPos(actor, ax, ay, az);
+    if (worldActor && g_enabled.load(std::memory_order_relaxed) && g_boxEsp.load(std::memory_order_relaxed)) {
+        noteWorldBox(ax, ay, az);
+        static int s_log = 0;
+        if (s_log < 8) {
+            logLine("SnowChams: actor world (%.1f, %.1f, %.1f)", ax, ay, az);
+            ++s_log;
+        }
+    }
+
+    // Inventory paper-doll / local actors: never recolor
+    if (!shouldApply() || (actor && !worldActor)) {
         g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
                           uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
         return;
