@@ -31,15 +31,15 @@ struct Color {
 constexpr const char* kModuleId = "bactro.handchams";
 
 std::atomic_bool g_enabled{false};
-std::atomic_bool g_handOnly{false};
-std::atomic_bool g_boxEsp{true};
+std::atomic_bool g_handOnly{true};
+std::atomic_bool g_boxEsp{false};
 std::atomic<float> g_r{1.00f};
 std::atomic<float> g_g{1.00f};
 std::atomic<float> g_b{1.00f};
-std::atomic<float> g_opacity{0.70f};
+std::atomic<float> g_opacity{0.45f};
 std::atomic_int g_hits{0};
 
-Color g_chams{1.f, 1.f, 1.f, 0.70f};
+Color g_chams{1.f, 1.f, 1.f, 0.45f};
 Color g_outline{1.f, 1.f, 1.f, 1.f};
 
 bool g_renderFpHooked = false;
@@ -91,6 +91,16 @@ std::atomic_bool g_vpValid{false};
 std::atomic<float> g_lineWidth{2.5f};
 std::atomic_int g_modelHits{0};
 
+// Local player world pos (from NormalTick) — filter ESP to nearby real entities
+std::atomic<float> g_lpX{0}, g_lpY{0}, g_lpZ{0};
+std::atomic_bool g_lpValid{false};
+using ActorIsPlayerFn = bool (*)(void*);
+ActorIsPlayerFn g_isPlayer = nullptr;
+using NormalTickFn = void (*)(void*);
+NormalTickFn g_tickOriginal = nullptr;
+bool g_tickHooked = false;
+
+
 bool finite16(const float* m) {
     for (int i = 0; i < 16; ++i)
         if (!std::isfinite(m[i])) return false;
@@ -123,7 +133,9 @@ bool looksLikeModelMatrix(const float* m, float& tx, float& ty, float& tz) {
     if (!std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(tz)) return false;
     // Reject bone/local matrices like (0,12,0) / inventory — need real world XZ
     float xz = std::sqrt(tx * tx + tz * tz);
+    // bone matrices often z=0; world/view should have meaningful spread
     if (xz < 16.f) return false;
+    if (std::fabs(tz) < 0.5f && std::fabs(tx) < 16.f) return false;
     if (std::fabs(tx) > 300000.f || std::fabs(tz) > 300000.f) return false;
     if (ty < -80.f || ty > 500.f) return false;
     float sx = std::fabs(m[0]) + std::fabs(m[1]) + std::fabs(m[2]);
@@ -144,21 +156,70 @@ bool probeActorWorldPos(void* actor, float& x, float& y, float& z) {
         0x150, 0x160, 0x168, 0x180, 0x190, 0x1A0, 0x1C0, 0x1E0, 0x200, 0x220, 0x240, 0x260, 0x280, 0x2A0,
         0x2C0, 0x300, 0x340, 0x380, 0x3C0, 0x400, 0x440, 0x480, 0x4C0, 0x500, 0x540, 0x580
     };
+    const bool haveLp = g_lpValid.load(std::memory_order_acquire);
+    const float lx = g_lpX.load(std::memory_order_relaxed);
+    const float ly = g_lpY.load(std::memory_order_relaxed);
+    const float lz = g_lpZ.load(std::memory_order_relaxed);
+
     for (int off : kOff) {
         float* f = reinterpret_cast<float*>(base + off);
         float px = f[0], py = f[1], pz = f[2];
         if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz)) continue;
-        float xz = std::sqrt(px * px + pz * pz);
-        // world-like: away from origin XZ, reasonable Y
-        if (xz < 16.f) continue;
+        // Reject garbage like (-19733, 0, 0) — need non-trivial Y and Z usually
+        if (std::fabs(py) < 0.01f && std::fabs(pz) < 0.01f) continue;
         if (std::fabs(px) > 300000.f || std::fabs(pz) > 300000.f) continue;
         if (py < -64.f || py > 400.f) continue;
+        float xz = std::sqrt(px * px + pz * pz);
+        if (xz < 8.f) continue; // inventory / local
+        // Prefer near local player when we know where we are
+        if (haveLp) {
+            float dx = px - lx, dy = py - ly, dz = pz - lz;
+            float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 > 180.f * 180.f) continue; // >180 blocks away = wrong field
+        }
         x = px;
         y = py;
         z = pz;
         return true;
     }
     return false;
+}
+
+void normalTickDetour(void* self) {
+    if (g_tickOriginal) g_tickOriginal(self);
+    if (!self) return;
+    // Track local player position for ESP filtering
+    bool isP = false;
+    if (g_isPlayer) {
+        try {
+            isP = g_isPlayer(self);
+        } catch (...) {
+            isP = false;
+        }
+    }
+    if (!isP) return;
+    float x, y, z;
+    // For local player, relax probe: accept any reasonable pos (we're the reference)
+    auto* base = reinterpret_cast<unsigned char*>(self);
+    static const int kOff[] = {0x48, 0x50, 0x68, 0x70, 0x88, 0x90, 0xA0, 0xB0, 0xC8, 0xD0, 0x100, 0x120,
+                               0x148, 0x168, 0x190, 0x1C0, 0x200, 0x240, 0x280, 0x2C0, 0x300, 0x380, 0x400};
+    for (int off : kOff) {
+        float* f = reinterpret_cast<float*>(base + off);
+        float px = f[0], py = f[1], pz = f[2];
+        if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz)) continue;
+        if (std::fabs(px) > 300000.f || std::fabs(pz) > 300000.f) continue;
+        if (py < -64.f || py > 400.f) continue;
+        // Prefer coords that look like the F3-style position range (not pure zeros)
+        if (std::fabs(px) < 1.f && std::fabs(pz) < 1.f) continue;
+        g_lpX.store(px, std::memory_order_relaxed);
+        g_lpY.store(py, std::memory_order_relaxed);
+        g_lpZ.store(pz, std::memory_order_relaxed);
+        if (!g_lpValid.load(std::memory_order_relaxed)) {
+            logLine("SnowChams: local pos (%.1f, %.1f, %.1f)", px, py, pz);
+        }
+        g_lpValid.store(true, std::memory_order_release);
+        return;
+    }
 }
 
 void noteWorldBox(float x, float y, float z) {
@@ -412,31 +473,23 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
                               const void* glintUVScale, const void* uvAnim, float uvOffset1, float uvOffset2,
                               float uvRot1, float uvRot2) {
     if (!g_setEntityConstants) return;
-    // Hand path only for setEntityConstants (avoids inventory paper-doll wash)
+    // Only first-person hand — never inventory / world entity via this hook
     const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
-    if (!g_enabled.load(std::memory_order_relaxed) || (!fp && g_handOnly.load(std::memory_order_relaxed))) {
-        g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
-                             overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
-                             uvOffset2, uvRot1, uvRot2);
-        return;
-    }
-    if (!fp && !shouldApply()) {
-        g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
-                             overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
-                             uvOffset2, uvRot1, uvRot2);
-        return;
-    }
-    // Prefer FP hand for this hook; entity bodies use setupActorGlint(worldActor)
-    if (!fp) {
+    const bool on = g_enabled.load(std::memory_order_relaxed) && fp;
+    if (!on) {
         g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
                              overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
                              uvOffset2, uvRot1, uvRot2);
         return;
     }
     refresh();
+    // Stack copies (avoid sticky pointer). Keep real lighting — replacing tileLight blacked-out Hive.
+    Color fill = g_chams;
+    Color edge = g_outline; // solid white glint = edge/outline look on hand
+    edge.a = 1.f;
     g_entityRenderArmed.store(true, std::memory_order_release);
-    g_setEntityConstants(entityConstants, renderContext, &g_chams, tileLightColorUV, blockLightColor, &g_chams,
-                         &g_chams, &g_chams, &g_outline, glintUVScale, uvAnim, uvOffset1, uvOffset2, uvRot1, uvRot2);
+    g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor, &fill,
+                         &fill, &fill, &edge, glintUVScale, uvAnim, uvOffset1, uvOffset2, uvRot1, uvRot2);
 }
 
 using SetupActorGlintFn = void (*)(void*, void*, void*, const Color*, const Color*, const Color*, const Color*,
@@ -461,15 +514,18 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
         }
     }
 
-    // Inventory paper-doll / local actors: never recolor
-    if (!shouldApply() || (actor && !worldActor)) {
+    // Default: never recolor world entities (Hive-safe). Optional soft chams only if Hand-only OFF.
+    const bool wantEntityChams = g_enabled.load(std::memory_order_relaxed) && worldActor &&
+                                 !g_handOnly.load(std::memory_order_relaxed);
+    if (!wantEntityChams) {
         g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
                           uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
         return;
     }
     refresh();
-    g_entityRenderArmed.store(true, std::memory_order_release);
-    g_setupActorGlint(screenContext, entityContext, actor, &g_chams, &g_chams, &g_chams, &g_outline, uvOffset1,
+    Color fill = g_chams;
+    // Soft: only overlay-ish channels, keep caller glint if any — less Hive corruption
+    g_setupActorGlint(screenContext, entityContext, actor, &fill, changeColor, changeColor2, glintColor, uvOffset1,
                       uvOffset2, uvRot1, uvRot2, lightEmissionColor);
 }
 
@@ -480,20 +536,37 @@ void setupGlintDetour(void* screenContext, void* entityContext, void* actor, con
                       const Color* changeColor, const Color* changeColor2, const Color* glintColor, float uvOffset1,
                       float uvOffset2, float uvRot1, float uvRot2, const void* lightEmissionColor) {
     if (!g_setupGlint) return;
-    if (!shouldApply()) {
+    if (!g_enabled.load(std::memory_order_relaxed) || !bactro::phase::inFirstPersonHand.load(std::memory_order_acquire)) {
         g_setupGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor, uvOffset1,
                      uvOffset2, uvRot1, uvRot2, lightEmissionColor);
         return;
     }
     refresh();
-    g_entityRenderArmed.store(true, std::memory_order_release);
-    g_setupGlint(screenContext, entityContext, actor, &g_chams, &g_chams, &g_chams, &g_outline, uvOffset1, uvOffset2,
+    Color fill = g_chams;
+    Color edge = g_outline;
+    edge.a = 1.f;
+    g_setupGlint(screenContext, entityContext, actor, &fill, changeColor, changeColor2, &edge, uvOffset1, uvOffset2,
                  uvRot1, uvRot2, lightEmissionColor);
 }
 
 void tryInstallHooks() {
     void* o = nullptr;
     installVpHook();
+    if (!g_isPlayer) {
+        std::uintptr_t addr = bactro::memory::resolve(bactro::memory::SignatureId::ActorIsPlayer);
+        if (addr) g_isPlayer = reinterpret_cast<ActorIsPlayerFn>(addr);
+    }
+    if (!g_tickHooked) {
+        o = nullptr;
+        if (bactro::memory::hook(bactro::memory::SignatureId::NormalTick, reinterpret_cast<void*>(&normalTickDetour),
+                                 &o) &&
+            o) {
+            g_tickOriginal = reinterpret_cast<NormalTickFn>(o);
+            g_tickHooked = true;
+            logLine("SnowChams: NormalTick hooked (local pos)");
+        } else
+            logLine("SnowChams: NormalTick FAIL");
+    }
     if (!g_renderFpHooked) {
         o = nullptr;
         if (bactro::memory::hook(bactro::memory::SignatureId::ItemInHandRendererRenderFirstPerson,
@@ -571,16 +644,16 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Snow Chams ESP");
-    b.description("White hand chams + world box ESP from model matrices. No intensity slider.")
+    b.description("Hand white fill + glint outline (Hive-safe). Box ESP optional. Entity chams only if Hand-only OFF.")
         .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
     b.config("r", "Red", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
-    b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.70", "0.05", "1.0", "");
-    b.config("boxEsp", "White box ESP", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
-    b.config("handOnly", "Hand/items only", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.45", "0.05", "1.0", "");
+    b.config("boxEsp", "White box ESP", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("handOnly", "Hand/items only", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.registerModule();
 }
 
