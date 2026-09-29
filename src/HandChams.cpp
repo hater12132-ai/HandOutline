@@ -337,14 +337,18 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
                               const void* glintUVScale, const void* uvAnim, float uvOffset1, float uvOffset2,
                               float uvRot1, float uvRot2) {
     if (!g_setEntityConstants) return;
+    static int s_enter = 0;
+    if (s_enter < 8) {
+        logLine("HandChams: setEntityConstants ENTER #%d en=%d", s_enter,
+                g_enabled.load(std::memory_order_relaxed) ? 1 : 0);
+        ++s_enter;
+    }
     if (!g_enabled.load(std::memory_order_relaxed)) {
         g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
                              overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
                              uvOffset2, uvRot1, uvRot2);
         return;
     }
-    // Hand-only mode (default): always tint this path (item/hand materials).
-    // If Hand-only OFF we still only tint when FP flag was set this frame (avoid full world wash).
     const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
     const bool handMode = g_handOnly.load(std::memory_order_relaxed);
     if (!handMode && !fp) {
@@ -357,12 +361,24 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
     Color fill = g_chams;
     Color edge = g_outline;
     edge.a = 1.f;
+    // Also poke caller buffers if present (some paths ignore replaced pointers)
+    auto poke = [](const Color* p, const Color& v) {
+        if (!p) return;
+        auto* w = const_cast<Color*>(p);
+        w->r = v.r;
+        w->g = v.g;
+        w->b = v.b;
+        w->a = v.a;
+    };
+    poke(overlay, fill);
+    poke(changeColor, fill);
+    poke(changeColor2, fill);
+    poke(glintColor, edge);
     static int s_app = 0;
-    if (s_app < 6) {
-        logLine("HandChams: APPLY fill+outline #%d fp=%d", s_app, fp ? 1 : 0);
+    if (s_app < 8) {
+        logLine("HandChams: APPLY #%d fp=%d overlay=%p", s_app, fp ? 1 : 0, (void*)overlay);
         ++s_app;
     }
-    // Keep lighting; soft white fill + solid white glint edge
     g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor, &fill,
                          &fill, &fill, &edge, glintUVScale, uvAnim, uvOffset1, uvOffset2, uvRot1, uvRot2);
 }
@@ -377,6 +393,11 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
                            float uvOffset1, float uvOffset2, float uvRot1, float uvRot2,
                            const void* lightEmissionColor) {
     if (!g_setupActorGlint) return;
+    static int s_ag = 0;
+    if (s_ag < 5) {
+        logLine("HandChams: setupActorGlint ENTER #%d", s_ag);
+        ++s_ag;
+    }
 
     // Box ESP: arm matrix capture only for players when playersOnly, or any actor when not
     if (g_enabled.load(std::memory_order_relaxed) && g_boxEsp.load(std::memory_order_relaxed) && actor) {
@@ -422,6 +443,22 @@ void setupGlintDetour(void* screenContext, void* entityContext, void* actor, con
     edge.a = 1.f;
     g_setupGlint(screenContext, entityContext, actor, &fill, changeColor, changeColor2, &edge, uvOffset1, uvOffset2,
                  uvRot1, uvRot2, lightEmissionColor);
+}
+
+
+using SetupFoilFn = void (*)(void*, void*, void*, void*, void*, void*, void*, void*);
+SetupFoilFn g_setupFoil = nullptr;
+bool g_hookedFoil = false;
+
+void setupFoilDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7) {
+    if (!g_setupFoil) return;
+    static int s_f = 0;
+    if (s_f < 5) {
+        logLine("HandChams: SetupFoil ENTER #%d en=%d", s_f, g_enabled.load() ? 1 : 0);
+        ++s_f;
+    }
+    // Always call through — foil is enchanted-item path; still useful signal
+    g_setupFoil(a0, a1, a2, a3, a4, a5, a6, a7);
 }
 
 void tryInstallHooks() {
@@ -482,8 +519,20 @@ void tryInstallHooks() {
         } else
             logLine("HandChams: setupGlint FAIL");
     }
-    logLine("SnowChams: hooks fp=%d entity=%d actor=%d glint=%d matrix=%d", g_renderFpHooked ? 1 : 0,
-            g_hookedEntity ? 1 : 0, g_hookedActor ? 1 : 0, g_hookedGlint ? 1 : 0, g_glUniformHooked ? 1 : 0);
+    if (!g_hookedFoil) {
+        o = nullptr;
+        if (bactro::memory::hook(bactro::memory::SignatureId::ActorShaderManagerSetupFoilShaderParameters,
+                                 reinterpret_cast<void*>(&setupFoilDetour), &o) &&
+            o) {
+            g_setupFoil = reinterpret_cast<SetupFoilFn>(o);
+            g_hookedFoil = true;
+            logLine("HandChams: setupFoil hooked");
+        } else
+            logLine("HandChams: setupFoil FAIL");
+    }
+    logLine("SnowChams: hooks fp=%d entity=%d actor=%d glint=%d foil=%d matrix=%d", g_renderFpHooked ? 1 : 0,
+            g_hookedEntity ? 1 : 0, g_hookedActor ? 1 : 0, g_hookedGlint ? 1 : 0, g_hookedFoil ? 1 : 0,
+            g_glUniformHooked ? 1 : 0);
 }
 
 void onToggle(std::string_view, bool enabled) {
