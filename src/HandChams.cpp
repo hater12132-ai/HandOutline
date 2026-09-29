@@ -358,29 +358,18 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
         return;
     }
     refresh();
-    Color fill = g_chams;
-    Color edge = g_outline;
-    edge.a = 1.f;
-    // Also poke caller buffers if present (some paths ignore replaced pointers)
-    auto poke = [](const Color* p, const Color& v) {
-        if (!p) return;
-        auto* w = const_cast<Color*>(p);
-        w->r = v.r;
-        w->g = v.g;
-        w->b = v.b;
-        w->a = v.a;
-    };
-    poke(overlay, fill);
-    poke(changeColor, fill);
-    poke(changeColor2, fill);
-    poke(glintColor, edge);
+    static Color s_fill{};
+    static Color s_edge{};
+    s_fill = g_chams;
+    s_edge = g_outline;
+    s_edge.a = 1.f;
     static int s_app = 0;
     if (s_app < 8) {
-        logLine("HandChams: APPLY #%d fp=%d overlay=%p", s_app, fp ? 1 : 0, (void*)overlay);
+        logLine("HandChams: APPLY #%d fp=%d", s_app, fp ? 1 : 0);
         ++s_app;
     }
-    g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor, &fill,
-                         &fill, &fill, &edge, glintUVScale, uvAnim, uvOffset1, uvOffset2, uvRot1, uvRot2);
+    g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor, &s_fill,
+                         &s_fill, &s_fill, &s_edge, glintUVScale, uvAnim, uvOffset1, uvOffset2, uvRot1, uvRot2);
 }
 
 using SetupActorGlintFn = void (*)(void*, void*, void*, const Color*, const Color*, const Color*, const Color*,
@@ -393,18 +382,18 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
                            float uvOffset1, float uvOffset2, float uvRot1, float uvRot2,
                            const void* lightEmissionColor) {
     if (!g_setupActorGlint) return;
+
     static int s_ag = 0;
-    if (s_ag < 6) {
-        logLine("HandChams: setupActorGlint ENTER #%d en=%d", s_ag,
-                g_enabled.load(std::memory_order_relaxed) ? 1 : 0);
+    if (s_ag < 4) {
+        logLine("HandChams: setupActorGlint ENTER #%d en=%d (passthrough — color replace crashes this build)",
+                s_ag, g_enabled.load(std::memory_order_relaxed) ? 1 : 0);
         ++s_ag;
     }
 
-    // Box ESP arm (optional)
+    // Box ESP arm only — never touch color pointers (1.15.7/8 join crash)
     if (g_enabled.load(std::memory_order_relaxed) && g_boxEsp.load(std::memory_order_relaxed) && actor) {
         bool ok = true;
         if (g_playersOnly.load(std::memory_order_relaxed) && g_isPlayer) {
-            ok = false;
             try {
                 ok = g_isPlayer(actor);
             } catch (...) {
@@ -414,59 +403,19 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
         if (ok) g_entityRenderArmed.store(true, std::memory_order_release);
     }
 
-    // Status proved setEntityConstants never runs — THIS is the live shader param path (Merci PassData-ish).
-    // Apply white fill + outline when module on. handOnly: still apply here (this path is what paints meshes).
-    if (!g_enabled.load(std::memory_order_relaxed)) {
-        g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
-                          uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
-        return;
-    }
-
-    refresh();
-    Color fill = g_chams;
-    Color edge = g_outline;
-    edge.a = 1.f;
-    auto poke = [](const Color* p, const Color& v) {
-        if (!p) return;
-        auto* w = const_cast<Color*>(p);
-        w->r = v.r;
-        w->g = v.g;
-        w->b = v.b;
-        w->a = v.a;
-    };
-    poke(overlay, fill);
-    poke(changeColor, fill);
-    poke(changeColor2, fill);
-    poke(glintColor, edge);
-
-    static int s_app = 0;
-    if (s_app < 8) {
-        logLine("HandChams: GLINT APPLY #%d fill=%.2f edge=1.0", s_app, fill.a);
-        ++s_app;
-    }
-    g_setupActorGlint(screenContext, entityContext, actor, &fill, &fill, &fill, &edge, uvOffset1, uvOffset2, uvRot1,
-                      uvRot2, lightEmissionColor);
+    g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
+                      uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
 }
 
 void setupGlintDetour(void* screenContext, void* entityContext, void* actor, const Color* overlay,
                       const Color* changeColor, const Color* changeColor2, const Color* glintColor, float uvOffset1,
                       float uvOffset2, float uvRot1, float uvRot2, const void* lightEmissionColor) {
     if (!g_setupGlint) return;
-    if (!g_enabled.load(std::memory_order_relaxed)) {
-        g_setupGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor, uvOffset1,
-                     uvOffset2, uvRot1, uvRot2, lightEmissionColor);
-        return;
-    }
-    refresh();
-    Color fill = g_chams;
-    Color edge = g_outline;
-    edge.a = 1.f;
-    g_setupGlint(screenContext, entityContext, actor, &fill, &fill, &fill, &edge, uvOffset1, uvOffset2, uvRot1,
-                 uvRot2, lightEmissionColor);
+    // Passthrough only — same crash class as setupActorGlint when colors replaced
+    g_setupGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor, uvOffset1,
+                 uvOffset2, uvRot1, uvRot2, lightEmissionColor);
 }
 
-
-using SetupFoilFn = void (*)(void*, void*, void*, void*, void*, void*, void*, void*);
 SetupFoilFn g_setupFoil = nullptr;
 bool g_hookedFoil = false;
 
