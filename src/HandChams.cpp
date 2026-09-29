@@ -33,17 +33,19 @@ constexpr const char* kModuleId = "bactro.handchams";
 std::atomic_bool g_enabled{false};
 std::atomic_bool g_handOnly{true};
 std::atomic_bool g_boxEsp{false};
+std::atomic_bool g_playersOnly{true};
 std::atomic<float> g_r{1.00f};
 std::atomic<float> g_g{1.00f};
 std::atomic<float> g_b{1.00f};
 std::atomic<float> g_opacity{0.45f};
-std::atomic_int g_hits{0};
 
 Color g_chams{1.f, 1.f, 1.f, 0.45f};
 Color g_outline{1.f, 1.f, 1.f, 1.f};
 
 bool g_renderFpHooked = false;
-std::atomic_bool g_entityRenderArmed{false};
+bool g_hookedEntity = false;
+bool g_hookedActor = false;
+bool g_hookedGlint = false;
 
 void logLine(const char* fmt, ...) {
     char buf[220];
@@ -63,16 +65,6 @@ void refresh() {
                g_b.load(std::memory_order_relaxed), aa};
 }
 
-bool shouldApply() {
-    if (!g_enabled.load(std::memory_order_relaxed)) return false;
-    if (g_handOnly.load(std::memory_order_relaxed)) {
-        if (g_renderFpHooked)
-            return bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
-        return true;
-    }
-    return true;
-}
-
 void* glProc(const char* name) {
     if (void* p = reinterpret_cast<void*>(eglGetProcAddress(name))) return p;
     static void* h = dlopen("libGLESv2.so", RTLD_NOW);
@@ -80,6 +72,7 @@ void* glProc(const char* name) {
     return h ? dlsym(h, name) : nullptr;
 }
 
+// ---- Optional box ESP (off by default; players only) ----
 struct Box {
     float minx, miny, minz, maxx, maxy, maxz;
 };
@@ -88,18 +81,14 @@ std::vector<Box> g_boxes;
 std::mutex g_vpMu;
 float g_viewProj[16]{};
 std::atomic_bool g_vpValid{false};
-std::atomic<float> g_lineWidth{2.5f};
-std::atomic_int g_modelHits{0};
 
-// Local player world pos (from NormalTick) — filter ESP to nearby real entities
-std::atomic<float> g_lpX{0}, g_lpY{0}, g_lpZ{0};
-std::atomic_bool g_lpValid{false};
 using ActorIsPlayerFn = bool (*)(void*);
 ActorIsPlayerFn g_isPlayer = nullptr;
-using NormalTickFn = void (*)(void*);
-NormalTickFn g_tickOriginal = nullptr;
-bool g_tickHooked = false;
 
+using PFN_glUniformMatrix4fv = void (*)(int, int, unsigned char, const float*);
+PFN_glUniformMatrix4fv g_glUniformMatrix4fvOrig = nullptr;
+bool g_glUniformHooked = false;
+std::atomic_bool g_entityRenderArmed{false};
 
 bool finite16(const float* m) {
     for (int i = 0; i < 16; ++i)
@@ -109,131 +98,35 @@ bool finite16(const float* m) {
 
 bool looksLikeViewProj(const float* m) {
     if (!m || !finite16(m)) return false;
-    bool id = true;
-    for (int i = 0; i < 16; ++i) {
-        float e = (i % 5 == 0) ? 1.f : 0.f;
-        if (std::fabs(m[i] - e) > 1e-4f) {
-            id = false;
-            break;
-        }
-    }
-    if (id) return false;
     float s = 0.f;
     for (int i = 0; i < 16; ++i) s += std::fabs(m[i]);
     if (s < 2.f || s > 1e5f) return false;
     return std::fabs(m[11]) > 0.05f || std::fabs(m[14]) > 0.05f;
 }
 
-bool looksLikeModelMatrix(const float* m, float& tx, float& ty, float& tz) {
+bool looksLikeWorldModel(const float* m, float& tx, float& ty, float& tz) {
     if (!m || !finite16(m)) return false;
     if (std::fabs(m[15] - 1.f) > 0.15f) return false;
     tx = m[12];
     ty = m[13];
     tz = m[14];
     if (!std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(tz)) return false;
-    // Reject bone/local matrices like (0,12,0) / inventory — need real world XZ
     float xz = std::sqrt(tx * tx + tz * tz);
-    // bone matrices often z=0; world/view should have meaningful spread
     if (xz < 16.f) return false;
-    if (std::fabs(tz) < 0.5f && std::fabs(tx) < 16.f) return false;
+    if (std::fabs(ty) < 0.5f && std::fabs(tz) < 0.5f) return false;
+    if (ty < -64.f || ty > 400.f) return false;
     if (std::fabs(tx) > 300000.f || std::fabs(tz) > 300000.f) return false;
-    if (ty < -80.f || ty > 500.f) return false;
-    float sx = std::fabs(m[0]) + std::fabs(m[1]) + std::fabs(m[2]);
-    float sy = std::fabs(m[4]) + std::fabs(m[5]) + std::fabs(m[6]);
-    float sz = std::fabs(m[8]) + std::fabs(m[9]) + std::fabs(m[10]);
-    if (sx < 0.2f || sy < 0.2f || sz < 0.2f) return false;
-    if (sx > 20.f || sy > 20.f || sz > 20.f) return false;
     return true;
-}
-
-// Actor memory: find a world position (not AABB pair — those were degenerate)
-bool probeActorWorldPos(void* actor, float& x, float& y, float& z) {
-    if (!actor) return false;
-    auto* base = reinterpret_cast<unsigned char*>(actor);
-    static const int kOff[] = {
-        0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xA0,
-        0xA8, 0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xE0, 0xF0, 0x100, 0x110, 0x120, 0x128, 0x130, 0x140, 0x148,
-        0x150, 0x160, 0x168, 0x180, 0x190, 0x1A0, 0x1C0, 0x1E0, 0x200, 0x220, 0x240, 0x260, 0x280, 0x2A0,
-        0x2C0, 0x300, 0x340, 0x380, 0x3C0, 0x400, 0x440, 0x480, 0x4C0, 0x500, 0x540, 0x580
-    };
-    const bool haveLp = g_lpValid.load(std::memory_order_acquire);
-    const float lx = g_lpX.load(std::memory_order_relaxed);
-    const float ly = g_lpY.load(std::memory_order_relaxed);
-    const float lz = g_lpZ.load(std::memory_order_relaxed);
-
-    for (int off : kOff) {
-        float* f = reinterpret_cast<float*>(base + off);
-        float px = f[0], py = f[1], pz = f[2];
-        if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz)) continue;
-        // Reject garbage like (-19733, 0, 0) — need non-trivial Y and Z usually
-        if (std::fabs(py) < 0.01f && std::fabs(pz) < 0.01f) continue;
-        if (std::fabs(px) > 300000.f || std::fabs(pz) > 300000.f) continue;
-        if (py < -64.f || py > 400.f) continue;
-        float xz = std::sqrt(px * px + pz * pz);
-        if (xz < 8.f) continue; // inventory / local
-        // Prefer near local player when we know where we are
-        if (haveLp) {
-            float dx = px - lx, dy = py - ly, dz = pz - lz;
-            float d2 = dx * dx + dy * dy + dz * dz;
-            if (d2 > 180.f * 180.f) continue; // >180 blocks away = wrong field
-        }
-        x = px;
-        y = py;
-        z = pz;
-        return true;
-    }
-    return false;
-}
-
-void normalTickDetour(void* self) {
-    if (g_tickOriginal) g_tickOriginal(self);
-    if (!self) return;
-    // Track local player position for ESP filtering
-    bool isP = false;
-    if (g_isPlayer) {
-        try {
-            isP = g_isPlayer(self);
-        } catch (...) {
-            isP = false;
-        }
-    }
-    if (!isP) return;
-    float x, y, z;
-    // For local player, relax probe: accept any reasonable pos (we're the reference)
-    auto* base = reinterpret_cast<unsigned char*>(self);
-    static const int kOff[] = {0x48, 0x50, 0x68, 0x70, 0x88, 0x90, 0xA0, 0xB0, 0xC8, 0xD0, 0x100, 0x120,
-                               0x148, 0x168, 0x190, 0x1C0, 0x200, 0x240, 0x280, 0x2C0, 0x300, 0x380, 0x400};
-    for (int off : kOff) {
-        float* f = reinterpret_cast<float*>(base + off);
-        float px = f[0], py = f[1], pz = f[2];
-        if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz)) continue;
-        if (std::fabs(px) > 300000.f || std::fabs(pz) > 300000.f) continue;
-        if (py < -64.f || py > 400.f) continue;
-        // Prefer coords that look like the F3-style position range (not pure zeros)
-        if (std::fabs(px) < 1.f && std::fabs(pz) < 1.f) continue;
-        g_lpX.store(px, std::memory_order_relaxed);
-        g_lpY.store(py, std::memory_order_relaxed);
-        g_lpZ.store(pz, std::memory_order_relaxed);
-        if (!g_lpValid.load(std::memory_order_relaxed)) {
-            logLine("SnowChams: local pos (%.1f, %.1f, %.1f)", px, py, pz);
-        }
-        g_lpValid.store(true, std::memory_order_release);
-        return;
-    }
 }
 
 void noteWorldBox(float x, float y, float z) {
     Box b{x - 0.4f, y - 0.1f, z - 0.4f, x + 0.4f, y + 1.8f, z + 0.4f};
     std::lock_guard<std::mutex> lock(g_boxMu);
-    if (g_boxes.size() < 128) g_boxes.push_back(b);
+    if (g_boxes.size() < 64) g_boxes.push_back(b);
 }
 
-using PFN_glUniformMatrix4fv = void (*)(int, int, unsigned char, const float*);
-PFN_glUniformMatrix4fv g_glUniformMatrix4fvOrig = nullptr;
-bool g_glUniformHooked = false;
-
 void glUniformMatrix4fvDetour(int location, int count, unsigned char transpose, const float* value) {
-    if (value && count >= 1) {
+    if (value && count >= 1 && g_boxEsp.load(std::memory_order_relaxed)) {
         float m[16];
         if (transpose) {
             for (int r = 0; r < 4; ++r)
@@ -245,34 +138,25 @@ void glUniformMatrix4fvDetour(int location, int count, unsigned char transpose, 
             std::lock_guard<std::mutex> lock(g_vpMu);
             std::memcpy(g_viewProj, m, sizeof(m));
             g_vpValid.store(true, std::memory_order_release);
-        } else if (g_enabled.load(std::memory_order_relaxed) && g_boxEsp.load(std::memory_order_relaxed) &&
-                   g_entityRenderArmed.load(std::memory_order_acquire)) {
+        } else if (g_entityRenderArmed.load(std::memory_order_acquire)) {
             float tx, ty, tz;
-            if (looksLikeModelMatrix(m, tx, ty, tz)) {
-                noteWorldBox(tx, ty, tz);
-                int n = g_modelHits.fetch_add(1, std::memory_order_relaxed);
-                if (n < 8) logLine("SnowChams: model pos (%.1f, %.1f, %.1f)", tx, ty, tz);
-            }
+            if (looksLikeWorldModel(m, tx, ty, tz)) noteWorldBox(tx, ty, tz);
         }
     }
     if (g_glUniformMatrix4fvOrig) g_glUniformMatrix4fvOrig(location, count, transpose, value);
 }
 
-bool installVpHook() {
+bool installMatrixHook() {
     if (g_glUniformHooked) return true;
     void* target = glProc("glUniformMatrix4fv");
-    if (!target) {
-        logLine("SnowChams: glUniformMatrix4fv not found");
-        return false;
-    }
+    if (!target) return false;
     void* o = nullptr;
     if (pl::memory::hook(target, reinterpret_cast<void*>(&glUniformMatrix4fvDetour), &o) == 0 && o) {
         g_glUniformMatrix4fvOrig = reinterpret_cast<PFN_glUniformMatrix4fv>(o);
         g_glUniformHooked = true;
-        logLine("SnowChams: VP+model matrix HOOKED");
+        logLine("SnowChams: matrix HOOKED (box ESP)");
         return true;
     }
-    logLine("SnowChams: matrix hook FAIL");
     return false;
 }
 
@@ -280,11 +164,6 @@ bool worldToNdc(const float* vp, float x, float y, float z, float& ox, float& oy
     float clipX = vp[0] * x + vp[4] * y + vp[8] * z + vp[12];
     float clipY = vp[1] * x + vp[5] * y + vp[9] * z + vp[13];
     float clipW = vp[3] * x + vp[7] * y + vp[11] * z + vp[15];
-    if (std::fabs(clipW) < 1e-4f) {
-        clipX = vp[0] * x + vp[1] * y + vp[2] * z + vp[3];
-        clipY = vp[4] * x + vp[5] * y + vp[6] * z + vp[7];
-        clipW = vp[12] * x + vp[13] * y + vp[14] * z + vp[15];
-    }
     if (std::fabs(clipW) < 1e-4f) return false;
     ox = clipX / clipW;
     oy = clipY / clipW;
@@ -348,7 +227,6 @@ PFN_glBlendFunc d_glBlendFunc = nullptr;
 PFN_glLineWidth d_glLineWidth = nullptr;
 PFN_glEnable d_glEnable = nullptr;
 PFN_glDisable d_glDisable = nullptr;
-
 GLuint g_prog = 0, g_vbo = 0;
 GLint g_aPos = -1, g_uColor = -1;
 bool g_lineGlReady = false;
@@ -378,7 +256,6 @@ bool loadLineGl() {
     g_uColor = d_glGetUniformLocation(g_prog, "uColor");
     d_glGenBuffers(1, &g_vbo);
     g_lineGlReady = g_prog != 0;
-    if (g_lineGlReady) logLine("SnowChams: box ESP line shader OK");
     return g_lineGlReady;
 }
 
@@ -422,20 +299,12 @@ void drawBoxEsp() {
             }
         }
     }
-    if (lines.empty()) return;
-    float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
-    for (size_t i = 0; i + 1 < lines.size(); i += 2) {
-        minx = std::min(minx, lines[i]);
-        maxx = std::max(maxx, lines[i]);
-        miny = std::min(miny, lines[i + 1]);
-        maxy = std::max(maxy, lines[i + 1]);
-    }
-    if ((maxx - minx) < 0.02f && (maxy - miny) < 0.02f) return;
+    if (lines.size() < 4) return;
     if (!loadLineGl()) return;
     if (d_glDisable) d_glDisable(GL_DEPTH_TEST);
     if (d_glEnable) d_glEnable(GL_BLEND);
     if (d_glBlendFunc) d_glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    if (d_glLineWidth) d_glLineWidth(g_lineWidth.load());
+    if (d_glLineWidth) d_glLineWidth(2.5f);
     d_glUseProgram(g_prog);
     if (d_glUniform4f && g_uColor >= 0) d_glUniform4f(g_uColor, 1.f, 1.f, 1.f, 0.95f);
     d_glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
@@ -444,13 +313,9 @@ void drawBoxEsp() {
     d_glVertexAttribPointer((GLuint)g_aPos, 2, GL_FLOAT, 0, 0, nullptr);
     d_glDrawArrays(GL_LINES, 0, (GLsizei)(lines.size() / 2));
     d_glUseProgram(0);
-    static int s_log = 0;
-    if (s_log < 10) {
-        logLine("SnowChams: box ESP drew %d segs (%d boxes)", (int)(lines.size() / 4), (int)boxes.size());
-        ++s_log;
-    }
 }
 
+// ---- FP hand only ----
 using RenderFirstPersonFn = void (*)(void*, void*, void*, void*, void*, void*);
 RenderFirstPersonFn g_renderFpOriginal = nullptr;
 
@@ -465,7 +330,6 @@ using SetEntityConstantsFn = void (*)(void*, void*, const Color*, const void*, c
                                       const Color*, const Color*, const Color*, const void*, const void*, float,
                                       float, float, float);
 SetEntityConstantsFn g_setEntityConstants = nullptr;
-bool g_hookedEntity = false;
 
 void setEntityConstantsDetour(void* entityConstants, void* renderContext, const Color* tileLightColor,
                               const void* tileLightColorUV, const void* blockLightColor, const Color* overlay,
@@ -473,7 +337,6 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
                               const void* glintUVScale, const void* uvAnim, float uvOffset1, float uvOffset2,
                               float uvRot1, float uvRot2) {
     if (!g_setEntityConstants) return;
-    // Only first-person hand — never inventory / world entity via this hook
     const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
     const bool on = g_enabled.load(std::memory_order_relaxed) && fp;
     if (!on) {
@@ -483,11 +346,10 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
         return;
     }
     refresh();
-    // Stack copies (avoid sticky pointer). Keep real lighting — replacing tileLight blacked-out Hive.
     Color fill = g_chams;
-    Color edge = g_outline; // solid white glint = edge/outline look on hand
+    Color edge = g_outline;
     edge.a = 1.f;
-    g_entityRenderArmed.store(true, std::memory_order_release);
+    // Keep real lighting (Hive-safe). Soft fill + white glint outline.
     g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor, &fill,
                          &fill, &fill, &edge, glintUVScale, uvAnim, uvOffset1, uvOffset2, uvRot1, uvRot2);
 }
@@ -495,7 +357,7 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
 using SetupActorGlintFn = void (*)(void*, void*, void*, const Color*, const Color*, const Color*, const Color*,
                                    float, float, float, float, const void*);
 SetupActorGlintFn g_setupActorGlint = nullptr;
-bool g_hookedActor = false;
+SetupActorGlintFn g_setupGlint = nullptr;
 
 void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor, const Color* overlay,
                            const Color* changeColor, const Color* changeColor2, const Color* glintColor,
@@ -503,40 +365,34 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
                            const void* lightEmissionColor) {
     if (!g_setupActorGlint) return;
 
-    float ax = 0, ay = 0, az = 0;
-    const bool worldActor = actor && probeActorWorldPos(actor, ax, ay, az);
-    if (worldActor && g_enabled.load(std::memory_order_relaxed) && g_boxEsp.load(std::memory_order_relaxed)) {
-        noteWorldBox(ax, ay, az);
-        static int s_log = 0;
-        if (s_log < 8) {
-            logLine("SnowChams: actor world (%.1f, %.1f, %.1f)", ax, ay, az);
-            ++s_log;
+    // Box ESP: arm matrix capture only for players when playersOnly, or any actor when not
+    if (g_enabled.load(std::memory_order_relaxed) && g_boxEsp.load(std::memory_order_relaxed) && actor) {
+        bool ok = true;
+        if (g_playersOnly.load(std::memory_order_relaxed) && g_isPlayer) {
+            ok = false;
+            try {
+                ok = g_isPlayer(actor);
+            } catch (...) {
+                ok = false;
+            }
         }
+        // Mobs: when playersOnly is false, accept all; when true, only players
+        // User asked mobs + players — so playersOnly false means both; we add mobs by not filtering
+        if (ok) g_entityRenderArmed.store(true, std::memory_order_release);
     }
 
-    // Default: never recolor world entities (Hive-safe). Optional soft chams only if Hand-only OFF.
-    const bool wantEntityChams = g_enabled.load(std::memory_order_relaxed) && worldActor &&
-                                 !g_handOnly.load(std::memory_order_relaxed);
-    if (!wantEntityChams) {
-        g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
-                          uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
-        return;
-    }
-    refresh();
-    Color fill = g_chams;
-    // Soft: only overlay-ish channels, keep caller glint if any — less Hive corruption
-    g_setupActorGlint(screenContext, entityContext, actor, &fill, changeColor, changeColor2, glintColor, uvOffset1,
-                      uvOffset2, uvRot1, uvRot2, lightEmissionColor);
+    // NEVER recolor entity/cosmetic meshes here — cosmetics were getting washed, bodies not.
+    // Hand uses setEntityConstants + setupGlint in FP only.
+    g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
+                      uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
 }
-
-SetupActorGlintFn g_setupGlint = nullptr;
-bool g_hookedGlint = false;
 
 void setupGlintDetour(void* screenContext, void* entityContext, void* actor, const Color* overlay,
                       const Color* changeColor, const Color* changeColor2, const Color* glintColor, float uvOffset1,
                       float uvOffset2, float uvRot1, float uvRot2, const void* lightEmissionColor) {
     if (!g_setupGlint) return;
-    if (!g_enabled.load(std::memory_order_relaxed) || !bactro::phase::inFirstPersonHand.load(std::memory_order_acquire)) {
+    const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
+    if (!g_enabled.load(std::memory_order_relaxed) || !fp) {
         g_setupGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor, uvOffset1,
                      uvOffset2, uvRot1, uvRot2, lightEmissionColor);
         return;
@@ -551,22 +407,18 @@ void setupGlintDetour(void* screenContext, void* entityContext, void* actor, con
 
 void tryInstallHooks() {
     void* o = nullptr;
-    installVpHook();
+
     if (!g_isPlayer) {
         std::uintptr_t addr = bactro::memory::resolve(bactro::memory::SignatureId::ActorIsPlayer);
-        if (addr) g_isPlayer = reinterpret_cast<ActorIsPlayerFn>(addr);
+        if (addr) {
+            g_isPlayer = reinterpret_cast<ActorIsPlayerFn>(addr);
+            logLine("SnowChams: ActorIsPlayer @%p", reinterpret_cast<void*>(addr));
+        }
     }
-    if (!g_tickHooked) {
-        o = nullptr;
-        if (bactro::memory::hook(bactro::memory::SignatureId::NormalTick, reinterpret_cast<void*>(&normalTickDetour),
-                                 &o) &&
-            o) {
-            g_tickOriginal = reinterpret_cast<NormalTickFn>(o);
-            g_tickHooked = true;
-            logLine("SnowChams: NormalTick hooked (local pos)");
-        } else
-            logLine("SnowChams: NormalTick FAIL");
-    }
+
+    // Matrix hook only if box ESP wanted (avoids extra work / crash surface on launch)
+    if (g_boxEsp.load(std::memory_order_relaxed)) installMatrixHook();
+
     if (!g_renderFpHooked) {
         o = nullptr;
         if (bactro::memory::hook(bactro::memory::SignatureId::ItemInHandRendererRenderFirstPerson,
@@ -633,8 +485,11 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_opacity.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "handOnly")
             g_handOnly.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "boxEsp")
+        else if (key == "boxEsp") {
             g_boxEsp.store(value == "true" || value == "1", std::memory_order_relaxed);
+            if (g_boxEsp.load() && g_enabled.load()) installMatrixHook();
+        } else if (key == "playersOnly")
+            g_playersOnly.store(value == "true" || value == "1", std::memory_order_relaxed);
         refresh();
     } catch (...) {
     }
@@ -644,7 +499,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Snow Chams ESP");
-    b.description("Hand white fill + glint outline (Hive-safe). Box ESP optional. Entity chams only if Hand-only OFF.")
+    b.description("Stable FP hand white fill + glint outline. No entity recolor (Hive-safe). "
+                  "Optional box ESP for players/mobs.")
         .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
@@ -652,15 +508,17 @@ void registerModule() {
     b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.45", "0.05", "1.0", "");
-    b.config("boxEsp", "White box ESP", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("handOnly", "Hand/items only", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("boxEsp", "Box ESP", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("playersOnly", "ESP players only (off=players+mobs)", pl::modmenu::ConfigType::Toggle, "false", "",
+             "", "");
     b.registerModule();
 }
 
 void onSignaturesReady() {
     logLine("SnowChams: ready — join world, then enable");
     if (g_enabled.load(std::memory_order_relaxed)) {
-        logLine("SnowChams: was ON during resolve — installing hooks now");
+        logLine("SnowChams: was ON — installing hooks now");
         tryInstallHooks();
     }
 }

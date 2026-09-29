@@ -3,7 +3,7 @@
 namespace bactro {
 inline constexpr std::string_view Name = "BactroNative";
 inline constexpr std::string_view Author = "hater12132-ai";
-inline constexpr std::string_view Description = "Hive-safe hand chams + white glint outline; box ESP off.";
-inline constexpr std::string_view Version = "1.15.3";
+inline constexpr std::string_view Description = "Crash-safe FP hand chams; no entity recolor; optional player/mob boxes.";
+inline constexpr std::string_view Version = "1.15.4";
 inline constexpr std::string_view Library = "libBactroNative.so";
 }
