@@ -321,9 +321,9 @@ RenderFirstPersonFn g_renderFpOriginal = nullptr;
 
 void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5) {
     if (!g_renderFpOriginal) return;
+    // Stay armed until onPostFrame — constants often run outside this call stack
     bactro::phase::inFirstPersonHand.store(true, std::memory_order_release);
     g_renderFpOriginal(self, a1, a2, a3, a4, a5);
-    bactro::phase::inFirstPersonHand.store(false, std::memory_order_release);
 }
 
 using SetEntityConstantsFn = void (*)(void*, void*, const Color*, const void*, const void*, const Color*,
@@ -337,9 +337,17 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
                               const void* glintUVScale, const void* uvAnim, float uvOffset1, float uvOffset2,
                               float uvRot1, float uvRot2) {
     if (!g_setEntityConstants) return;
+    if (!g_enabled.load(std::memory_order_relaxed)) {
+        g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
+                             overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
+                             uvOffset2, uvRot1, uvRot2);
+        return;
+    }
+    // Hand-only mode (default): always tint this path (item/hand materials).
+    // If Hand-only OFF we still only tint when FP flag was set this frame (avoid full world wash).
     const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
-    const bool on = g_enabled.load(std::memory_order_relaxed) && fp;
-    if (!on) {
+    const bool handMode = g_handOnly.load(std::memory_order_relaxed);
+    if (!handMode && !fp) {
         g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
                              overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
                              uvOffset2, uvRot1, uvRot2);
@@ -349,7 +357,12 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
     Color fill = g_chams;
     Color edge = g_outline;
     edge.a = 1.f;
-    // Keep real lighting (Hive-safe). Soft fill + white glint outline.
+    static int s_app = 0;
+    if (s_app < 6) {
+        logLine("HandChams: APPLY fill+outline #%d fp=%d", s_app, fp ? 1 : 0);
+        ++s_app;
+    }
+    // Keep lighting; soft white fill + solid white glint edge
     g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor, &fill,
                          &fill, &fill, &edge, glintUVScale, uvAnim, uvOffset1, uvOffset2, uvRot1, uvRot2);
 }
@@ -391,8 +404,14 @@ void setupGlintDetour(void* screenContext, void* entityContext, void* actor, con
                       const Color* changeColor, const Color* changeColor2, const Color* glintColor, float uvOffset1,
                       float uvOffset2, float uvRot1, float uvRot2, const void* lightEmissionColor) {
     if (!g_setupGlint) return;
+    if (!g_enabled.load(std::memory_order_relaxed)) {
+        g_setupGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor, uvOffset1,
+                     uvOffset2, uvRot1, uvRot2, lightEmissionColor);
+        return;
+    }
     const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
-    if (!g_enabled.load(std::memory_order_relaxed) || !fp) {
+    const bool handMode = g_handOnly.load(std::memory_order_relaxed);
+    if (!handMode && !fp) {
         g_setupGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor, uvOffset1,
                      uvOffset2, uvRot1, uvRot2, lightEmissionColor);
         return;
@@ -526,9 +545,9 @@ void onSignaturesReady() {
 void shutdown() { g_enabled.store(false, std::memory_order_release); }
 
 void onPostFrame() {
-    if (!g_enabled.load(std::memory_order_relaxed)) return;
-    drawBoxEsp();
+    if (g_enabled.load(std::memory_order_relaxed)) drawBoxEsp();
     g_entityRenderArmed.store(false, std::memory_order_release);
+    bactro::phase::inFirstPersonHand.store(false, std::memory_order_release);
 }
 
 } // namespace bactro::handchams
