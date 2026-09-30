@@ -35,6 +35,7 @@ std::atomic_bool g_handOnly{false}; // false = allow world actors when targets e
 std::atomic_bool g_targetPlayers{true};
 std::atomic_bool g_targetMobs{true};   // non-player actors
 std::atomic_bool g_targetHand{true};   // FP hand / null actor (items, cosmetics-ish)
+std::atomic_bool g_skyHand{false};     // animated sky-like hue on hand/chams
 std::atomic<int> g_fpSticky{0};
 std::atomic_bool g_boxEsp{false};
 std::atomic_bool g_playersOnly{true};
@@ -59,6 +60,31 @@ void logLine(const char* fmt, ...) {
     va_end(ap);
     bactro::statusLine(buf);
     HC_LOGI("%s", buf);
+}
+
+
+Color skyChamsColor() {
+    using clock = std::chrono::steady_clock;
+    static const auto t0 = clock::now();
+    const double sec = std::chrono::duration<double>(clock::now() - t0).count();
+    // Slow hue cycle (plasma / aurora style)
+    float h = std::fmod(sec * 0.15, 1.0);
+    float s = 0.55f;
+    float v = 0.95f;
+    float a = g_opacity.load(std::memory_order_relaxed);
+    // HSV -> RGB
+    float c = v * s;
+    float x = c * (1.f - std::fabs(std::fmod(h * 6.f, 2.f) - 1.f));
+    float m = v - c;
+    float r, g, b;
+    int i = int(h * 6.f) % 6;
+    if (i == 0) { r = c; g = x; b = 0; }
+    else if (i == 1) { r = x; g = c; b = 0; }
+    else if (i == 2) { r = 0; g = c; b = x; }
+    else if (i == 3) { r = 0; g = x; b = c; }
+    else if (i == 4) { r = x; g = 0; b = c; }
+    else { r = c; g = 0; b = x; }
+    return {r + m, g + m, b + m, a};
 }
 
 void refresh() {
@@ -366,9 +392,15 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
     refresh();
     static Color s_fill{};
     static Color s_edge{};
-    s_fill = g_chams;
-    s_edge = g_outline;
-    s_edge.a = 1.f;
+    if (g_skyHand.load(std::memory_order_relaxed)) {
+        s_fill = skyChamsColor();
+        s_edge = s_fill;
+        s_edge.a = 1.f;
+    } else {
+        s_fill = g_chams;
+        s_edge = g_outline;
+        s_edge.a = 1.f;
+    }
     const Color* tile = (handWindow ? &s_fill : tileLightColor);
     static int s_app = 0;
     if (s_app < 12) {
@@ -442,9 +474,18 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
             refresh();
             static Color s_fill{};
             static Color s_edge{};
-            s_fill = g_chams;
-            s_edge = g_outline;
-            s_edge.a = 1.f;
+            if (g_skyHand.load(std::memory_order_relaxed)) {
+                s_fill = skyChamsColor();
+                s_edge = s_fill;
+                s_edge.a = 1.f;
+                s_edge.r = std::min(1.f, s_edge.r + 0.25f);
+                s_edge.g = std::min(1.f, s_edge.g + 0.25f);
+                s_edge.b = std::min(1.f, s_edge.b + 0.25f);
+            } else {
+                s_fill = g_chams;
+                s_edge = g_outline;
+                s_edge.a = 1.f;
+            }
             static int s_gapp = 0;
             if (s_gapp < 10) {
                 logLine("HandChams: GLINT APPLY #%d fp=%d actor=%p players=%d mobs=%d hand=%d", s_gapp,
@@ -584,6 +625,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_targetMobs.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "targetHand")
             g_targetHand.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "skyHand")
+            g_skyHand.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "boxEsp") {
             g_boxEsp.store(value == "true" || value == "1", std::memory_order_relaxed);
             if (g_boxEsp.load() && g_enabled.load()) installMatrixHook();
@@ -610,6 +653,7 @@ void registerModule() {
     b.config("targetPlayers", "Players", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetMobs", "Mobs / other actors", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetHand", "Hand / items / cosmetics", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("skyHand", "Sky-style animated colors", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("boxEsp", "Box ESP", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("playersOnly", "ESP players only (off=players+mobs)", pl::modmenu::ConfigType::Toggle, "false", "",
              "", "");
