@@ -32,14 +32,15 @@ constexpr const char* kModuleId = "bactro.handchams";
 
 std::atomic_bool g_enabled{false};
 std::atomic_bool g_handOnly{true};
+std::atomic<int> g_fpSticky{0}; // frames remaining after renderFirstPerson
 std::atomic_bool g_boxEsp{false};
 std::atomic_bool g_playersOnly{true};
 std::atomic<float> g_r{1.00f};
 std::atomic<float> g_g{1.00f};
 std::atomic<float> g_b{1.00f};
-std::atomic<float> g_opacity{0.45f};
+std::atomic<float> g_opacity{0.85f};
 
-Color g_chams{1.f, 1.f, 1.f, 0.45f};
+Color g_chams{1.f, 1.f, 1.f, 0.85f};
 Color g_outline{1.f, 1.f, 1.f, 1.f};
 
 bool g_renderFpHooked = false;
@@ -321,8 +322,8 @@ RenderFirstPersonFn g_renderFpOriginal = nullptr;
 
 void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5) {
     if (!g_renderFpOriginal) return;
-    // Stay armed until onPostFrame — constants often run outside this call stack
     bactro::phase::inFirstPersonHand.store(true, std::memory_order_release);
+    g_fpSticky.store(8, std::memory_order_release); // keep APPLY window for following constant setup
     g_renderFpOriginal(self, a1, a2, a3, a4, a5);
 }
 
@@ -350,12 +351,19 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
         return;
     }
     const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
+    const int sticky = g_fpSticky.load(std::memory_order_acquire);
+    const bool handWindow = fp || sticky > 0;
     const bool handMode = g_handOnly.load(std::memory_order_relaxed);
-    if (!handMode && !fp) {
+    // handOnly: only tint during FP/sticky window (not inventory dummy / world spam)
+    // !handOnly: tint everything when module on
+    if (handMode && !handWindow) {
         g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
                              overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
                              uvOffset2, uvRot1, uvRot2);
         return;
+    }
+    if (!handMode && !handWindow) {
+        // entity mode still needs a path — apply always when not handOnly
     }
     refresh();
     static Color s_fill{};
@@ -363,13 +371,14 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
     s_fill = g_chams;
     s_edge = g_outline;
     s_edge.a = 1.f;
+    const Color* tile = (handWindow ? &s_fill : tileLightColor);
     static int s_app = 0;
-    if (s_app < 8) {
-        logLine("HandChams: APPLY #%d fp=%d", s_app, fp ? 1 : 0);
+    if (s_app < 12) {
+        logLine("HandChams: APPLY #%d fp=%d sticky=%d", s_app, fp ? 1 : 0, sticky);
         ++s_app;
     }
-    g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor, &s_fill,
-                         &s_fill, &s_fill, &s_edge, glintUVScale, uvAnim, uvOffset1, uvOffset2, uvRot1, uvRot2);
+    g_setEntityConstants(entityConstants, renderContext, tile, tileLightColorUV, blockLightColor, &s_fill, &s_fill,
+                         &s_fill, &s_edge, glintUVScale, uvAnim, uvOffset1, uvOffset2, uvRot1, uvRot2);
 }
 
 using SetupActorGlintFn = void (*)(void*, void*, void*, const Color*, const Color*, const Color*, const Color*,
@@ -384,13 +393,12 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
     if (!g_setupActorGlint) return;
 
     static int s_ag = 0;
-    if (s_ag < 4) {
-        logLine("HandChams: setupActorGlint ENTER #%d en=%d (passthrough — color replace crashes this build)",
-                s_ag, g_enabled.load(std::memory_order_relaxed) ? 1 : 0);
+    if (s_ag < 6) {
+        logLine("HandChams: setupActorGlint ENTER #%d en=%d actor=%p", s_ag,
+                g_enabled.load(std::memory_order_relaxed) ? 1 : 0, actor);
         ++s_ag;
     }
 
-    // Box ESP arm only — never touch color pointers (1.15.7/8 join crash)
     if (g_enabled.load(std::memory_order_relaxed) && g_boxEsp.load(std::memory_order_relaxed) && actor) {
         bool ok = true;
         if (g_playersOnly.load(std::memory_order_relaxed) && g_isPlayer) {
@@ -401,6 +409,32 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
             }
         }
         if (ok) g_entityRenderArmed.store(true, std::memory_order_release);
+    }
+
+    // Hand/entity snow: static Color only (no stack pointers). Skip if crash returns — user disables.
+    if (g_enabled.load(std::memory_order_relaxed)) {
+        const bool handMode = g_handOnly.load(std::memory_order_relaxed);
+        const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
+        const int sticky = g_fpSticky.load(std::memory_order_acquire);
+        // handOnly: apply when FP/sticky OR actor is null (held-item often null actor)
+        // !handOnly: apply for all actors
+        const bool doChams = !handMode || fp || sticky > 0 || actor == nullptr;
+        if (doChams) {
+            refresh();
+            static Color s_fill{};
+            static Color s_edge{};
+            s_fill = g_chams;
+            s_edge = g_outline;
+            s_edge.a = 1.f;
+            static int s_gapp = 0;
+            if (s_gapp < 8) {
+                logLine("HandChams: GLINT APPLY #%d fp=%d sticky=%d actor=%p", s_gapp, fp ? 1 : 0, sticky, actor);
+                ++s_gapp;
+            }
+            g_setupActorGlint(screenContext, entityContext, actor, &s_fill, &s_fill, &s_fill, &s_edge, uvOffset1,
+                              uvOffset2, uvRot1, uvRot2, lightEmissionColor);
+            return;
+        }
     }
 
     g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
@@ -545,7 +579,7 @@ void registerModule() {
     b.config("r", "Red", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
-    b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.45", "0.05", "1.0", "");
+    b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.85", "0.05", "1.0", "");
     b.config("handOnly", "Hand/items only", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("boxEsp", "Box ESP", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("playersOnly", "ESP players only (off=players+mobs)", pl::modmenu::ConfigType::Toggle, "false", "",
@@ -567,6 +601,10 @@ void onPostFrame() {
     if (g_enabled.load(std::memory_order_relaxed)) drawBoxEsp();
     g_entityRenderArmed.store(false, std::memory_order_release);
     bactro::phase::inFirstPersonHand.store(false, std::memory_order_release);
+    {
+        int s = g_fpSticky.load(std::memory_order_relaxed);
+        if (s > 0) g_fpSticky.store(s - 1, std::memory_order_relaxed);
+    }
 }
 
 } // namespace bactro::handchams
