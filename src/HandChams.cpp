@@ -38,6 +38,7 @@ std::atomic_bool g_targetHand{true};   // FP hand / null actor (items, cosmetics
 std::atomic_bool g_skyShader{false};   // Lexora-style plasma/aurora on hand+items
 std::atomic<float> g_skySpeed{1.0f};   // animation speed
 std::atomic<float> g_skyOpacity{0.85f};
+std::atomic<int> g_skyMode{0}; // 0=plasma 1=aurora 2=midnight 3=nebula
 std::atomic<int> g_fpSticky{0};
 std::atomic_bool g_boxEsp{false};
 std::atomic_bool g_playersOnly{true};
@@ -65,63 +66,79 @@ void logLine(const char* fmt, ...) {
 }
 
 
-// Lexora plasma_sky.fsh / aurora color math (CPU approximation for Color* path)
+// Lexora sky modes → bright animated colors for Color* path (hand/items only)
 Color skyChamsColor() {
     using clock = std::chrono::steady_clock;
     static const auto t0 = clock::now();
     const float speed = g_skySpeed.load(std::memory_order_relaxed);
     const float opac = g_skyOpacity.load(std::memory_order_relaxed);
+    const int mode = g_skyMode.load(std::memory_order_relaxed);
     const double sec = std::chrono::duration<double>(clock::now() - t0).count();
-    const float t = static_cast<float>(sec) * speed * 0.4f;
+    const float t = static_cast<float>(sec) * speed;
 
-    // plasma_sky: layered sin/cos flow
-    float px = 3.f + t * 0.5f;
-    float py = 1.5f + t * 0.3f;
-    float pz = 2.0f + t * 0.4f;
-    float flow = 0.f;
-    float amp = 1.f;
-    for (int i = 0; i < 5; ++i) {
-        flow += amp * std::fabs(std::sin(px) * std::cos(py) + std::sin(pz));
-        // m3-ish rotate + scale
-        float nx = 0.36f * px + 0.48f * py - 0.80f * pz;
-        float ny = -0.80f * px + 0.60f * py;
-        float nz = 0.48f * px + 0.64f * py + 0.60f * pz;
-        px = nx * 1.3f;
-        py = ny * 1.3f;
-        pz = nz * 1.3f;
-        amp *= 0.6f;
+    float r = 1.f, g = 1.f, b = 1.f;
+
+    if (mode == 1) {
+        // aurora: green / cyan / magenta bands
+        float w = 0.5f + 0.5f * std::sin(t * 1.4f);
+        float w2 = 0.5f + 0.5f * std::sin(t * 0.9f + 1.7f);
+        r = 0.25f + 0.55f * w2;
+        g = 0.55f + 0.45f * w;
+        b = 0.70f + 0.30f * (1.f - w);
+    } else if (mode == 2) {
+        // midnight: deep blue + moon silver pulse
+        float star = 0.5f + 0.5f * std::sin(t * 2.2f);
+        r = 0.12f + 0.25f * star;
+        g = 0.18f + 0.30f * star;
+        b = 0.45f + 0.50f * star;
+    } else if (mode == 3) {
+        // nebula: purple / blue swirl
+        float f = 0.5f + 0.5f * std::sin(t * 1.1f);
+        float f2 = 0.5f + 0.5f * std::cos(t * 0.7f);
+        r = 0.45f + 0.40f * f;
+        g = 0.15f + 0.25f * f2;
+        b = 0.70f + 0.30f * (1.f - f);
+    } else {
+        // plasma (default): violet → pink → cyan (Lexora plasma_sky, boosted)
+        float px = 3.f + t * 0.5f, py = 1.5f + t * 0.3f, pz = 2.f + t * 0.4f;
+        float flow = 0.f, amp = 1.f;
+        for (int i = 0; i < 5; ++i) {
+            flow += amp * std::fabs(std::sin(px) * std::cos(py) + std::sin(pz));
+            float nx = 0.36f * px + 0.48f * py - 0.80f * pz;
+            float ny = -0.80f * px + 0.60f * py;
+            float nz = 0.48f * px + 0.64f * py + 0.60f * pz;
+            px = nx * 1.3f; py = ny * 1.3f; pz = nz * 1.3f;
+            amp *= 0.6f;
+        }
+        float x = (flow - 0.5f) / 2.f;
+        if (x < 0.f) x = 0.f;
+        if (x > 1.f) x = 1.f;
+        flow = x * x * (3.f - 2.f * x);
+        // bright mix so it is not near-black
+        float bg[3] = {0.20f, 0.05f, 0.35f};
+        float c1[3] = {0.95f, 0.25f, 0.70f};
+        float c2[3] = {0.20f, 0.90f, 1.00f};
+        float col[3];
+        for (int i = 0; i < 3; ++i) col[i] = bg[i] + (c1[i] - bg[i]) * flow;
+        float hi = (flow - 0.5f) / 0.5f;
+        if (hi < 0.f) hi = 0.f;
+        if (hi > 1.f) hi = 1.f;
+        hi = hi * hi * (3.f - 2.f * hi);
+        for (int i = 0; i < 3; ++i) col[i] = col[i] + (c2[i] - col[i]) * hi;
+        r = col[0]; g = col[1]; b = col[2];
     }
-    // smoothstep(0.5, 2.5, flow)
-    float x = (flow - 0.5f) / 2.0f;
-    if (x < 0.f) x = 0.f;
-    if (x > 1.f) x = 1.f;
-    flow = x * x * (3.f - 2.f * x);
 
-    // Lexora default: bg violet -> pink nebula -> cyan highlights
-    const float bg[3] = {0.05f, 0.01f, 0.10f};
-    const float c1[3] = {0.60f, 0.10f, 0.40f};
-    const float c2[3] = {0.10f, 0.70f, 0.80f};
-    float col[3];
-    for (int i = 0; i < 3; ++i)
-        col[i] = bg[i] + (c1[i] - bg[i]) * flow;
-    float hi = (flow - 0.6f) / 0.4f;
-    if (hi < 0.f) hi = 0.f;
-    if (hi > 1.f) hi = 1.f;
-    hi = hi * hi * (3.f - 2.f * hi);
-    for (int i = 0; i < 3; ++i)
-        col[i] = col[i] + (c2[i] - col[i]) * hi;
-
-    // mild aurora green pulse on top
-    float aurora = 0.5f + 0.5f * std::sin(t * 1.2f);
-    col[1] = col[1] + 0.15f * aurora * flow;
-    col[2] = col[2] + 0.10f * aurora * flow;
-
-    for (int i = 0; i < 3; ++i) {
-        if (col[i] < 0.f) col[i] = 0.f;
-        if (col[i] > 1.f) col[i] = 1.f;
-    }
-    return {col[0], col[1], col[2], opac};
+    // floor brightness so RD doesn't read as black
+    const float floor = 0.15f;
+    if (r < floor) r = floor;
+    if (g < floor) g = floor;
+    if (b < floor) b = floor;
+    if (r > 1.f) r = 1.f;
+    if (g > 1.f) g = 1.f;
+    if (b > 1.f) b = 1.f;
+    return {r, g, b, opac};
 }
+
 
 void refresh() {
     float aa = g_opacity.load(std::memory_order_relaxed);
@@ -486,10 +503,12 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
         const bool handWin = fp || sticky > 0;
 
         bool doChams = false;
-        if (actor == nullptr) {
-            // Held items / cosmetics — always when skyShader, else targetHand
-            doChams = g_skyShader.load(std::memory_order_relaxed) ||
-                      g_targetHand.load(std::memory_order_relaxed);
+        const bool skyOn = g_skyShader.load(std::memory_order_relaxed);
+        if (skyOn) {
+            // Sky is hand/items only — never player body/armor (those use real actor*)
+            doChams = (actor == nullptr) || handWin;
+        } else if (actor == nullptr) {
+            doChams = g_targetHand.load(std::memory_order_relaxed);
         } else {
             bool isPl = false;
             if (g_isPlayer) {
@@ -666,6 +685,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_skySpeed.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "skyOpacity")
             g_skyOpacity.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        else if (key == "skyMode")
+            g_skyMode.store(static_cast<int>(std::stof(std::string(value))), std::memory_order_relaxed);
         else if (key == "boxEsp") {
             g_boxEsp.store(value == "true" || value == "1", std::memory_order_relaxed);
             if (g_boxEsp.load() && g_enabled.load()) installMatrixHook();
@@ -695,6 +716,7 @@ void registerModule() {
     b.config("skyShader", "Lexora Sky on hand/items", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("skySpeed", "Sky speed", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.1", "5.0", "");
     b.config("skyOpacity", "Sky opacity", pl::modmenu::ConfigType::SliderFloat, "0.85", "0.05", "1.0", "");
+    b.config("skyMode", "Sky mode 0=plasma 1=aurora 2=midnight 3=nebula", pl::modmenu::ConfigType::SliderFloat, "0", "0", "3", "");
     b.config("boxEsp", "Box ESP", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("playersOnly", "ESP players only (off=players+mobs)", pl::modmenu::ConfigType::Toggle, "false", "",
              "", "");
