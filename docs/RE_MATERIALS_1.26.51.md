@@ -39,3 +39,25 @@
 
 Vibrant Visuals edge uniforms may only apply when that pipeline is active.  
 Glow outline may be gated by `HideGlowOutline` option bit.
+
+## Phase 3 findings (EDGE registry)
+
+Uniform **name registry** (not direct ADRP xrefs to strings):
+
+| File offset | Content |
+|-------------|---------|
+| 0xdcae78 | ptr → `ITEM_IN_HAND_EDGE_BRIGHTNESS` |
+| 0xdcae90 | ptr → `ITEM_IN_HAND_EDGE_TIGHTNESS` |
+| 0xdcaea8 | ptr → `ITEM_IN_HAND_EDGE_SHARPNESS` |
+| 0xdcaec0 | ptr → `ENTITY_EDGE_BRIGHTNESS` |
+| … | ENTITY_EDGE_TIGHTNESS / SHARPNESS / LOD_SCALAR |
+
+Layout pattern: `{ reloc_slot, 0x403, c_str_va }` repeating.
+
+Rela.dyn maps hashed-string objects at VA `0x12b8bc10+`.
+
+No code ADRP directly to EDGE C-strings in scanned ranges — values applied via **MaterialUniformOverrides** + registry, not string literals in draw code.
+
+`HideGlowOutlineQuery` resolves but **never called** in user sessions (glow option path inactive).
+
+Phase3 runtime: dump floats on ItemInHandShaderSetup args to locate override slots.

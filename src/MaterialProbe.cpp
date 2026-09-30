@@ -7,9 +7,10 @@
 
 #include <android/log.h>
 #include <atomic>
+#include <cmath>
 #include <cstdarg>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -20,11 +21,12 @@ namespace bactro::material {
 namespace {
 
 std::atomic_bool g_enabled{false};
-std::atomic_bool g_forceGlow{true}; // when ON: HideGlowOutline reports false (show glow)
+std::atomic_bool g_forceGlow{true};
+std::atomic_bool g_dumpFloats{true};
 std::atomic_bool g_hooksInstalled{false};
 
 void logLine(const char* fmt, ...) {
-    char buf[256];
+    char buf[280];
     va_list ap;
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -33,7 +35,23 @@ void logLine(const char* fmt, ...) {
     MP_LOGI("%s", buf);
 }
 
-// HideGlowOutline query — (ctx, …) returns non-zero if glow should be hidden
+void dumpFloats(const char* tag, void* p, int count) {
+    if (!p || !g_dumpFloats.load(std::memory_order_relaxed)) return;
+    auto* f = reinterpret_cast<float*>(p);
+    char line[280];
+    int n = std::snprintf(line, sizeof(line), "MaterialRE: %s floats", tag);
+    for (int i = 0; i < count && n < 240; ++i) {
+        float v = f[i];
+        if (!std::isfinite(v)) {
+            n += std::snprintf(line + n, sizeof(line) - n, " [%d]=nan", i);
+            continue;
+        }
+        if (std::fabs(v) > 1000.f) continue; // skip junk
+        n += std::snprintf(line + n, sizeof(line) - n, " [%d]=%.3f", i, v);
+    }
+    logLine("%s", line);
+}
+
 using HideGlowFn = std::int64_t (*)(void*, void*, void*, void*, void*, void*, void*, void*);
 HideGlowFn g_hideGlowOrig = nullptr;
 
@@ -41,50 +59,30 @@ std::int64_t hideGlowDetour(void* a0, void* a1, void* a2, void* a3, void* a4, vo
     std::int64_t r = 0;
     if (g_hideGlowOrig) r = g_hideGlowOrig(a0, a1, a2, a3, a4, a5, a6, a7);
     static int s_n = 0;
-    if (s_n < 6) {
-        logLine("MaterialRE: HideGlow call #%d raw=%lld en=%d", s_n, (long long)r,
-                g_enabled.load(std::memory_order_relaxed) ? 1 : 0);
+    if (s_n < 4) {
+        logLine("MaterialRE: HideGlow call #%d raw=%lld", s_n, (long long)r);
         ++s_n;
     }
-    if (g_enabled.load(std::memory_order_relaxed) && g_forceGlow.load(std::memory_order_relaxed)) {
-        // Force "do not hide" so engine glow outline path can run
-        return 0;
-    }
+    if (g_enabled.load(std::memory_order_relaxed) && g_forceGlow.load(std::memory_order_relaxed)) return 0;
     return r;
 }
 
-// Item-in-hand shader setup — wide arity so we do not clobber x3–x7
 using ItemHandFn = void (*)(void*, void*, void*, void*, void*, void*, void*, void*);
 ItemHandFn g_itemHandOrig = nullptr;
 
 void itemHandDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7) {
     static int s_n = 0;
-    if (s_n < 6) {
-        logLine("MaterialRE: ItemInHandSetup ENTER #%d en=%d", s_n,
-                g_enabled.load(std::memory_order_relaxed) ? 1 : 0);
+    const bool en = g_enabled.load(std::memory_order_relaxed);
+    if (s_n < 8) {
+        logLine("MaterialRE: ItemInHandSetup ENTER #%d en=%d a0=%p a1=%p a2=%p", s_n, en ? 1 : 0, a0, a1, a2);
+        if (en) {
+            dumpFloats("a0", a0, 12);
+            dumpFloats("a1", a1, 12);
+            dumpFloats("a2", a2, 12);
+        }
         ++s_n;
     }
     if (g_itemHandOrig) g_itemHandOrig(a0, a1, a2, a3, a4, a5, a6, a7);
-}
-
-// Material bin path — log only
-using MatBinFn = void (*)(void*, void*, void*, void*, void*, void*, void*, void*, void*);
-MatBinFn g_matBinOrig = nullptr;
-
-void matBinDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8) {
-    static int s_n = 0;
-    if (s_n < 3) {
-        logLine("MaterialRE: MaterialBinPath ENTER #%d", s_n);
-        ++s_n;
-    }
-    // Forward with best-effort arity — trampoline keeps real registers; we only need log
-    if (g_matBinOrig) {
-        // Call through as raw function pointer with same stack — use original via casting carefully
-        using Raw = void (*)(void*);
-        // Prefer storing original and calling with minimal disruption:
-        reinterpret_cast<void (*)(void*, void*, void*, void*, void*, void*, void*, void*, void*)>(g_matBinOrig)(
-            a0, a1, a2, a3, a4, a5, a6, a7, a8);
-    }
 }
 
 bool installHooks() {
@@ -99,9 +97,8 @@ bool installHooks() {
         g_hideGlowOrig = reinterpret_cast<HideGlowFn>(o);
         logLine("MaterialRE: HideGlowOutlineQuery HOOKED");
         any = true;
-    } else {
+    } else
         logLine("MaterialRE: HideGlowOutlineQuery HOOK FAIL");
-    }
 
     o = nullptr;
     if (bactro::memory::hook(bactro::memory::SignatureId::ItemInHandShaderSetup,
@@ -110,11 +107,8 @@ bool installHooks() {
         g_itemHandOrig = reinterpret_cast<ItemHandFn>(o);
         logLine("MaterialRE: ItemInHandShaderSetup HOOKED");
         any = true;
-    } else {
+    } else
         logLine("MaterialRE: ItemInHandShaderSetup HOOK FAIL");
-    }
-
-    // Skip MaterialBinPathBuilder hook — arity unknown; resolve-only is enough for now
 
     g_hooksInstalled.store(any, std::memory_order_release);
     return any;
@@ -130,6 +124,9 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
     if (key == "forceGlow") {
         g_forceGlow.store(value == "true" || value == "1", std::memory_order_relaxed);
         logLine("MaterialRE: forceGlow=%d", g_forceGlow.load() ? 1 : 0);
+    } else if (key == "dumpFloats") {
+        g_dumpFloats.store(value == "true" || value == "1", std::memory_order_relaxed);
+        logLine("MaterialRE: dumpFloats=%d", g_dumpFloats.load() ? 1 : 0);
     }
 }
 
@@ -150,19 +147,19 @@ void onSignaturesReady() {
     logLine("MaterialRE: MaterialBinPathBuilder %s @%p", mbin ? "OK" : "MISS", reinterpret_cast<void*>(mbin));
     logLine("MaterialRE: MaterialMissingError %s @%p", miss ? "OK" : "MISS", reinterpret_cast<void*>(miss));
     logLine("MaterialRE: RenderMaterialGroupCommon %s @%p", group ? "OK" : "MISS", reinterpret_cast<void*>(group));
-    logLine("MaterialRE: EDGE uniforms: ITEM_IN_HAND_EDGE_* ENTITY_EDGE_*");
+    logLine("MaterialRE: EDGE registry @ file 0xdcae78 (ITEM_IN_HAND_EDGE_* ENTITY_EDGE_*)");
+    logLine("MaterialRE: phase3 — dump ItemInHand arg floats to map MaterialUniformOverrides");
 
-    // Register module once
     static bool reg = false;
     if (!reg) {
         reg = true;
         pl::modmenu::ModuleBuilder b("bactro.material_re", "Material RE Glow");
-        b.description("Native RD: force HideGlowOutline off + ItemInHand setup probe. Phase2.")
+        b.description("Phase3: dump ItemInHand floats; force HideGlow if called.")
             .defaultEnabled(false)
             .onToggle(onToggle)
             .onConfigChanged(onConfig);
-        b.config("forceGlow", "Force show glow (HideGlow=0)", pl::modmenu::ConfigType::Toggle, "true", "", "",
-                 "");
+        b.config("forceGlow", "Force show glow", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+        b.config("dumpFloats", "Dump ItemInHand floats", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
         b.registerModule();
         logLine("MaterialRE: module registered");
     }
