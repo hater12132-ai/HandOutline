@@ -416,6 +416,7 @@ void setupGlintDetour(void* screenContext, void* entityContext, void* actor, con
                  uvOffset2, uvRot1, uvRot2, lightEmissionColor);
 }
 
+using SetupFoilFn = void (*)(void*, void*, void*, void*, void*, void*, void*, void*);
 SetupFoilFn g_setupFoil = nullptr;
 bool g_hookedFoil = false;
 
