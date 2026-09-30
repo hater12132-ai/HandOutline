@@ -35,7 +35,9 @@ std::atomic_bool g_handOnly{false}; // false = allow world actors when targets e
 std::atomic_bool g_targetPlayers{true};
 std::atomic_bool g_targetMobs{true};   // non-player actors
 std::atomic_bool g_targetHand{true};   // FP hand / null actor (items, cosmetics-ish)
-std::atomic_bool g_skyHand{false};     // animated sky-like hue on hand/chams
+std::atomic_bool g_skyShader{false};   // Lexora-style plasma/aurora on hand+items
+std::atomic<float> g_skySpeed{1.0f};   // animation speed
+std::atomic<float> g_skyOpacity{0.85f};
 std::atomic<int> g_fpSticky{0};
 std::atomic_bool g_boxEsp{false};
 std::atomic_bool g_playersOnly{true};
@@ -63,28 +65,62 @@ void logLine(const char* fmt, ...) {
 }
 
 
+// Lexora plasma_sky.fsh / aurora color math (CPU approximation for Color* path)
 Color skyChamsColor() {
     using clock = std::chrono::steady_clock;
     static const auto t0 = clock::now();
+    const float speed = g_skySpeed.load(std::memory_order_relaxed);
+    const float opac = g_skyOpacity.load(std::memory_order_relaxed);
     const double sec = std::chrono::duration<double>(clock::now() - t0).count();
-    // Slow hue cycle (plasma / aurora style)
-    float h = std::fmod(sec * 0.15, 1.0);
-    float s = 0.55f;
-    float v = 0.95f;
-    float a = g_opacity.load(std::memory_order_relaxed);
-    // HSV -> RGB
-    float c = v * s;
-    float x = c * (1.f - std::fabs(std::fmod(h * 6.f, 2.f) - 1.f));
-    float m = v - c;
-    float r, g, b;
-    int i = int(h * 6.f) % 6;
-    if (i == 0) { r = c; g = x; b = 0; }
-    else if (i == 1) { r = x; g = c; b = 0; }
-    else if (i == 2) { r = 0; g = c; b = x; }
-    else if (i == 3) { r = 0; g = x; b = c; }
-    else if (i == 4) { r = x; g = 0; b = c; }
-    else { r = c; g = 0; b = x; }
-    return {r + m, g + m, b + m, a};
+    const float t = static_cast<float>(sec) * speed * 0.4f;
+
+    // plasma_sky: layered sin/cos flow
+    float px = 3.f + t * 0.5f;
+    float py = 1.5f + t * 0.3f;
+    float pz = 2.0f + t * 0.4f;
+    float flow = 0.f;
+    float amp = 1.f;
+    for (int i = 0; i < 5; ++i) {
+        flow += amp * std::fabs(std::sin(px) * std::cos(py) + std::sin(pz));
+        // m3-ish rotate + scale
+        float nx = 0.36f * px + 0.48f * py - 0.80f * pz;
+        float ny = -0.80f * px + 0.60f * py;
+        float nz = 0.48f * px + 0.64f * py + 0.60f * pz;
+        px = nx * 1.3f;
+        py = ny * 1.3f;
+        pz = nz * 1.3f;
+        amp *= 0.6f;
+    }
+    // smoothstep(0.5, 2.5, flow)
+    float x = (flow - 0.5f) / 2.0f;
+    if (x < 0.f) x = 0.f;
+    if (x > 1.f) x = 1.f;
+    flow = x * x * (3.f - 2.f * x);
+
+    // Lexora default: bg violet -> pink nebula -> cyan highlights
+    const float bg[3] = {0.05f, 0.01f, 0.10f};
+    const float c1[3] = {0.60f, 0.10f, 0.40f};
+    const float c2[3] = {0.10f, 0.70f, 0.80f};
+    float col[3];
+    for (int i = 0; i < 3; ++i)
+        col[i] = bg[i] + (c1[i] - bg[i]) * flow;
+    float hi = (flow - 0.6f) / 0.4f;
+    if (hi < 0.f) hi = 0.f;
+    if (hi > 1.f) hi = 1.f;
+    hi = hi * hi * (3.f - 2.f * hi);
+    for (int i = 0; i < 3; ++i)
+        col[i] = col[i] + (c2[i] - col[i]) * hi;
+
+    // mild aurora green pulse on top
+    float aurora = 0.5f + 0.5f * std::sin(t * 1.2f);
+    col[1] = col[1] + 0.15f * aurora * flow;
+    col[2] = col[2] + 0.10f * aurora * flow;
+
+    for (int i = 0; i < 3; ++i) {
+        if (col[i] < 0.f) col[i] = 0.f;
+        if (col[i] > 1.f) col[i] = 1.f;
+    }
+    return {col[0], col[1], col[2], opac};
 }
 
 void refresh() {
@@ -382,8 +418,10 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
     const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
     const int sticky = g_fpSticky.load(std::memory_order_acquire);
     const bool handWindow = fp || sticky > 0;
-    // Constants path is mostly hand/item materials — gate with targetHand
-    if (!g_targetHand.load(std::memory_order_relaxed) || !handWindow) {
+    // Sky shader: tint all item/hand constant setups when enabled
+    // Otherwise: gate with targetHand + FP window
+    const bool skyOn = g_skyShader.load(std::memory_order_relaxed);
+    if (!skyOn && (!g_targetHand.load(std::memory_order_relaxed) || !handWindow)) {
         g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
                              overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
                              uvOffset2, uvRot1, uvRot2);
@@ -392,7 +430,7 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
     refresh();
     static Color s_fill{};
     static Color s_edge{};
-    if (g_skyHand.load(std::memory_order_relaxed)) {
+    if (g_skyShader.load(std::memory_order_relaxed)) {
         s_fill = skyChamsColor();
         s_edge = s_fill;
         s_edge.a = 1.f;
@@ -449,12 +487,9 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
 
         bool doChams = false;
         if (actor == nullptr) {
-            // Held item / cosmetics path often has null actor
-            doChams = g_targetHand.load(std::memory_order_relaxed) && (handWin || true);
-            // Restrict null-actor to FP window when handOnly legacy-ish: only if targetHand
-            if (!handWin && !g_targetHand.load(std::memory_order_relaxed)) doChams = false;
-            // Cosmetics in world also use null actor — allow if targetHand OR targetMobs
-            if (!handWin) doChams = g_targetHand.load(std::memory_order_relaxed);
+            // Held items / cosmetics — always when skyShader, else targetHand
+            doChams = g_skyShader.load(std::memory_order_relaxed) ||
+                      g_targetHand.load(std::memory_order_relaxed);
         } else {
             bool isPl = false;
             if (g_isPlayer) {
@@ -474,7 +509,7 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
             refresh();
             static Color s_fill{};
             static Color s_edge{};
-            if (g_skyHand.load(std::memory_order_relaxed)) {
+            if (g_skyShader.load(std::memory_order_relaxed)) {
                 s_fill = skyChamsColor();
                 s_edge = s_fill;
                 s_edge.a = 1.f;
@@ -487,32 +522,10 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
                 s_edge.a = 1.f;
             }
 
-            // Discord RE path: RenderParams::mParams float[8] @ +0x108 (1.21+/1.26 layouts)
-            // entityContext may be RenderParams* or contain one — try poke overlay-ish floats
-            if (entityContext) {
-                auto* base = reinterpret_cast<unsigned char*>(entityContext);
-                auto* params = reinterpret_cast<float*>(base + 0x108);
-                static int s_rp = 0;
-                if (s_rp < 6) {
-                    logLine("HandChams: RenderParams? mParams[0..3]=%.3f %.3f %.3f %.3f", params[0], params[1],
-                            params[2], params[3]);
-                    ++s_rp;
-                }
-                // Soft write: only if values look like normalized colors/params (0..2)
-                for (int i = 0; i < 4; ++i) {
-                    float v = params[i];
-                    if (std::isfinite(v) && v >= 0.f && v <= 2.f) {
-                        if (i == 0) params[i] = s_fill.r;
-                        else if (i == 1) params[i] = s_fill.g;
-                        else if (i == 2) params[i] = s_fill.b;
-                        else params[i] = s_fill.a;
-                    }
-                }
-            }
-
             static int s_gapp = 0;
             if (s_gapp < 10) {
-                logLine("HandChams: GLINT APPLY #%d fp=%d actor=%p", s_gapp, fp ? 1 : 0, actor);
+                logLine("HandChams: GLINT APPLY #%d fp=%d actor=%p (Color* only; need mid-hook for outline)", s_gapp,
+                        fp ? 1 : 0, actor);
                 ++s_gapp;
             }
             g_setupActorGlint(screenContext, entityContext, actor, &s_fill, &s_fill, &s_fill, &s_edge, uvOffset1,
@@ -647,8 +660,12 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_targetMobs.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "targetHand")
             g_targetHand.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "skyHand")
-            g_skyHand.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "skyShader")
+            g_skyShader.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "skySpeed")
+            g_skySpeed.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        else if (key == "skyOpacity")
+            g_skyOpacity.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "boxEsp") {
             g_boxEsp.store(value == "true" || value == "1", std::memory_order_relaxed);
             if (g_boxEsp.load() && g_enabled.load()) installMatrixHook();
@@ -675,7 +692,9 @@ void registerModule() {
     b.config("targetPlayers", "Players", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetMobs", "Mobs / other actors", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetHand", "Hand / items / cosmetics", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
-    b.config("skyHand", "Sky-style animated colors", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("skyShader", "Lexora Sky on hand/items", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("skySpeed", "Sky speed", pl::modmenu::ConfigType::Slider, "1.0", "0.1", "5.0", "");
+    b.config("skyOpacity", "Sky opacity", pl::modmenu::ConfigType::Slider, "0.85", "0.05", "1.0", "");
     b.config("boxEsp", "Box ESP", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("playersOnly", "ESP players only (off=players+mobs)", pl::modmenu::ConfigType::Toggle, "false", "",
              "", "");
