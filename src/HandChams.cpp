@@ -486,11 +486,33 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
                 s_edge = g_outline;
                 s_edge.a = 1.f;
             }
+
+            // Discord RE path: RenderParams::mParams float[8] @ +0x108 (1.21+/1.26 layouts)
+            // entityContext may be RenderParams* or contain one — try poke overlay-ish floats
+            if (entityContext) {
+                auto* base = reinterpret_cast<unsigned char*>(entityContext);
+                auto* params = reinterpret_cast<float*>(base + 0x108);
+                static int s_rp = 0;
+                if (s_rp < 6) {
+                    logLine("HandChams: RenderParams? mParams[0..3]=%.3f %.3f %.3f %.3f", params[0], params[1],
+                            params[2], params[3]);
+                    ++s_rp;
+                }
+                // Soft write: only if values look like normalized colors/params (0..2)
+                for (int i = 0; i < 4; ++i) {
+                    float v = params[i];
+                    if (std::isfinite(v) && v >= 0.f && v <= 2.f) {
+                        if (i == 0) params[i] = s_fill.r;
+                        else if (i == 1) params[i] = s_fill.g;
+                        else if (i == 2) params[i] = s_fill.b;
+                        else params[i] = s_fill.a;
+                    }
+                }
+            }
+
             static int s_gapp = 0;
             if (s_gapp < 10) {
-                logLine("HandChams: GLINT APPLY #%d fp=%d actor=%p players=%d mobs=%d hand=%d", s_gapp,
-                        fp ? 1 : 0, actor, g_targetPlayers.load() ? 1 : 0, g_targetMobs.load() ? 1 : 0,
-                        g_targetHand.load() ? 1 : 0);
+                logLine("HandChams: GLINT APPLY #%d fp=%d actor=%p", s_gapp, fp ? 1 : 0, actor);
                 ++s_gapp;
             }
             g_setupActorGlint(screenContext, entityContext, actor, &s_fill, &s_fill, &s_fill, &s_edge, uvOffset1,

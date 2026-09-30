@@ -61,3 +61,14 @@ No code ADRP directly to EDGE C-strings in scanned ranges — values applied via
 `HideGlowOutlineQuery` resolves but **never called** in user sessions (glow option path inactive).
 
 Phase3 runtime: dump floats on ItemInHandShaderSetup args to locate override slots.
+
+## Phase 3 experiment result (FAILED)
+
+ItemInHandShaderSetup args:
+- a0 stable heap object, mostly zeros + [8]=1.0
+- a1 [2]=1.012 [3]=0.744 looked edge-like but writing produced garbage
+  (readback 1.6e16) — **not float uniform slots**, likely mixed pointer/matrix memory
+- HideGlowOutlineQuery never invoked at runtime
+
+Conclusion: Color* glint swaps crash; float poking ItemInHand args does nothing useful.
+Real chams require MaterialFilter / CreateMaterialImmediate + material.bin (Stray-style).
