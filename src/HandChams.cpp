@@ -693,8 +693,8 @@ void registerModule() {
     b.config("targetMobs", "Mobs / other actors", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetHand", "Hand / items / cosmetics", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("skyShader", "Lexora Sky on hand/items", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
-    b.config("skySpeed", "Sky speed", pl::modmenu::ConfigType::Slider, "1.0", "0.1", "5.0", "");
-    b.config("skyOpacity", "Sky opacity", pl::modmenu::ConfigType::Slider, "0.85", "0.05", "1.0", "");
+    b.config("skySpeed", "Sky speed", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.1", "5.0", "");
+    b.config("skyOpacity", "Sky opacity", pl::modmenu::ConfigType::SliderFloat, "0.85", "0.05", "1.0", "");
     b.config("boxEsp", "Box ESP", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("playersOnly", "ESP players only (off=players+mobs)", pl::modmenu::ConfigType::Toggle, "false", "",
              "", "");
