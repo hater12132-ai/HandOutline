@@ -73,12 +73,25 @@ ItemHandFn g_itemHandOrig = nullptr;
 void itemHandDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7) {
     static int s_n = 0;
     const bool en = g_enabled.load(std::memory_order_relaxed);
-    if (s_n < 8) {
-        logLine("MaterialRE: ItemInHandSetup ENTER #%d en=%d a0=%p a1=%p a2=%p", s_n, en ? 1 : 0, a0, a1, a2);
-        if (en) {
-            dumpFloats("a0", a0, 12);
-            dumpFloats("a1", a1, 12);
-            dumpFloats("a2", a2, 12);
+
+    // Phase3 write: a1[2]=1.012 a1[3]=0.744 were stable mid-range — try edge boost
+    if (en && a1) {
+        auto* f = reinterpret_cast<float*>(a1);
+        // Only touch if values still look like the observed edge-ish range
+        if (std::isfinite(f[2]) && f[2] > 0.2f && f[2] < 3.0f) f[2] = 4.0f; // brightness-ish
+        if (std::isfinite(f[3]) && f[3] > 0.1f && f[3] < 2.0f) f[3] = 0.15f; // tightness-ish
+        // a0[8] was 1.0 — mild boost
+        if (a0) {
+            auto* g = reinterpret_cast<float*>(a0);
+            if (std::isfinite(g[8]) && g[8] > 0.5f && g[8] < 1.5f) g[8] = 2.0f;
+        }
+    }
+
+    if (s_n < 6) {
+        logLine("MaterialRE: ItemInHandSetup ENTER #%d en=%d", s_n, en ? 1 : 0);
+        if (en && a1) {
+            auto* f = reinterpret_cast<float*>(a1);
+            logLine("MaterialRE: a1 after write [2]=%.3f [3]=%.3f", f[2], f[3]);
         }
         ++s_n;
     }
