@@ -52,6 +52,18 @@ const std::array<SignatureDefinition, SignatureCount> definitions{{
     SignatureDefinition{SignatureId::MeshHelpersRenderMeshImmediately, "? ? ? A9 ? ? ? F9 ? ? ? A9 ? ? ? A9 ? ? ? A9 FD 03 00 91 ? ? ? D1 58 D0 3B D5 F7 03 00 AA E0 03 01 AA ? ? ? F9 F4 03 04 AA"},
     SignatureDefinition{SignatureId::MeshHelpersRenderMeshImmediately2, "? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 FD 03 00 91 ? ? ? D1 57 D0 3B D5 F6 03 00 AA E0 03 01 AA ? ? ? F9 F4 03 03 AA"},
     SignatureDefinition{SignatureId::RenderMaterialGroupCommon, "? ? ? 90 ? ? ? 91 ? ? ? D1 ? ? ? D1 ? ? ? 91 E3 03 14 AA"},
+    // HideGlowOutline-related frame (unique on 1.26.51 @ ~0x1063007c)
+    SignatureDefinition{SignatureId::HideGlowOutlineQuery,
+                        "FD 7B 16 A9 FC 57 17 A9 F4 4F 18 A9 FD 83 05 91 55 D0 3B D5 F3 03 01 AA F4 03 00 AA A8 16 40 F9"},
+    // ItemInHandColor / glint setup family (@ ~0x10fe2650)
+    SignatureDefinition{SignatureId::ItemInHandShaderSetup,
+                        "FD 7B 01 A9 FC 6F 02 A9 FA 67 03 A9 F8 5F 04 A9 F6 57 05 A9 F4 4F 06 A9 FD 43 00 91 FF 07 40 D1 FF 83 13 D1 5C D0 3B D5 F4 03 02 AA F5 03 01 AA"},
+    // .material.bin path builder (@ ~0x11363a84)
+    SignatureDefinition{SignatureId::MaterialBinPathBuilder,
+                        "FD 7B BA A9 FC 0B 00 F9 FA 67 02 A9 F8 5F 03 A9 F6 57 04 A9 F4 4F 05 A9 FD 03 00 91 FF 03 07 D1 58 D0 3B D5 F3 03 08 AA 00 E4 00 6F 08 17 40 F9"},
+    // "Could not find specified material" (@ ~0xf24b4d0)
+    SignatureDefinition{SignatureId::MaterialMissingError,
+                        "23 AB F9 F0 63 40 23 91 22 0A 6A 96 F3 03 1F 2A E8 1F 40 F9 1C D1 41 F9 08 D5 41 F9"},
     SignatureDefinition{SignatureId::SurvivalModeStartDestroyBlock, "? ? ? 39 ? ? ? 34 ? ? ? 90 ? ? ? 39 ? ? ? 34 ? ? ? A9 FD 03 00 91 E1 03 1F 2A ? ? ? 94"},
     SignatureDefinition{SignatureId::GameModeStartDestroyBlock, "? ? ? D1 ? ? ? A9 ? ? ? F9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 59 D0 3B D5 F4 03 00 AA F5 03 03 AA ? ? ? F9 F6 03 02 2A"},
     SignatureDefinition{SignatureId::GameModeStopDestroyBlock, "? ? ? A9 ? ? ? F9 FD 03 00 91 F3 03 00 AA ? ? ? F9 ? ? ? BD ? ? ? F9 ? ? ? F9 00 01 3F D6 E0 03 22 1E ? ? ? BD ? ? ? F9 ? ? ? F9 ? ? ? A8 C0 03 5F D6"},

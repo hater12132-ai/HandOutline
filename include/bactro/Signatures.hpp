@@ -48,6 +48,11 @@ enum class SignatureId : std::uint16_t {
     MeshHelpersRenderMeshImmediately,
     MeshHelpersRenderMeshImmediately2,
     RenderMaterialGroupCommon,
+    // RenderDragon material / edge-glow RE (1.26.51)
+    HideGlowOutlineQuery,
+    ItemInHandShaderSetup,
+    MaterialBinPathBuilder,
+    MaterialMissingError,
     SurvivalModeStartDestroyBlock,
     GameModeStartDestroyBlock,
     GameModeStopDestroyBlock,
