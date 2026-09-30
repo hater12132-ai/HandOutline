@@ -31,8 +31,11 @@ struct Color {
 constexpr const char* kModuleId = "bactro.handchams";
 
 std::atomic_bool g_enabled{false};
-std::atomic_bool g_handOnly{true};
-std::atomic<int> g_fpSticky{0}; // frames remaining after renderFirstPerson
+std::atomic_bool g_handOnly{false}; // false = allow world actors when targets enabled
+std::atomic_bool g_targetPlayers{true};
+std::atomic_bool g_targetMobs{true};   // non-player actors
+std::atomic_bool g_targetHand{true};   // FP hand / null actor (items, cosmetics-ish)
+std::atomic<int> g_fpSticky{0};
 std::atomic_bool g_boxEsp{false};
 std::atomic_bool g_playersOnly{true};
 std::atomic<float> g_r{1.00f};
@@ -353,17 +356,12 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
     const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
     const int sticky = g_fpSticky.load(std::memory_order_acquire);
     const bool handWindow = fp || sticky > 0;
-    const bool handMode = g_handOnly.load(std::memory_order_relaxed);
-    // handOnly: only tint during FP/sticky window (not inventory dummy / world spam)
-    // !handOnly: tint everything when module on
-    if (handMode && !handWindow) {
+    // Constants path is mostly hand/item materials — gate with targetHand
+    if (!g_targetHand.load(std::memory_order_relaxed) || !handWindow) {
         g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
                              overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
                              uvOffset2, uvRot1, uvRot2);
         return;
-    }
-    if (!handMode && !handWindow) {
-        // entity mode still needs a path — apply always when not handOnly
     }
     refresh();
     static Color s_fill{};
@@ -411,14 +409,35 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
         if (ok) g_entityRenderArmed.store(true, std::memory_order_release);
     }
 
-    // Hand/entity snow: static Color only (no stack pointers). Skip if crash returns — user disables.
+    // Snow chams: static Color only. Filter by Players / Mobs / Hand.
     if (g_enabled.load(std::memory_order_relaxed)) {
-        const bool handMode = g_handOnly.load(std::memory_order_relaxed);
         const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
         const int sticky = g_fpSticky.load(std::memory_order_acquire);
-        // handOnly: apply when FP/sticky OR actor is null (held-item often null actor)
-        // !handOnly: apply for all actors
-        const bool doChams = !handMode || fp || sticky > 0 || actor == nullptr;
+        const bool handWin = fp || sticky > 0;
+
+        bool doChams = false;
+        if (actor == nullptr) {
+            // Held item / cosmetics path often has null actor
+            doChams = g_targetHand.load(std::memory_order_relaxed) && (handWin || true);
+            // Restrict null-actor to FP window when handOnly legacy-ish: only if targetHand
+            if (!handWin && !g_targetHand.load(std::memory_order_relaxed)) doChams = false;
+            // Cosmetics in world also use null actor — allow if targetHand OR targetMobs
+            if (!handWin) doChams = g_targetHand.load(std::memory_order_relaxed);
+        } else {
+            bool isPl = false;
+            if (g_isPlayer) {
+                try {
+                    isPl = g_isPlayer(actor);
+                } catch (...) {
+                    isPl = false;
+                }
+            }
+            if (isPl)
+                doChams = g_targetPlayers.load(std::memory_order_relaxed);
+            else
+                doChams = g_targetMobs.load(std::memory_order_relaxed);
+        }
+
         if (doChams) {
             refresh();
             static Color s_fill{};
@@ -427,8 +446,10 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
             s_edge = g_outline;
             s_edge.a = 1.f;
             static int s_gapp = 0;
-            if (s_gapp < 8) {
-                logLine("HandChams: GLINT APPLY #%d fp=%d sticky=%d actor=%p", s_gapp, fp ? 1 : 0, sticky, actor);
+            if (s_gapp < 10) {
+                logLine("HandChams: GLINT APPLY #%d fp=%d actor=%p players=%d mobs=%d hand=%d", s_gapp,
+                        fp ? 1 : 0, actor, g_targetPlayers.load() ? 1 : 0, g_targetMobs.load() ? 1 : 0,
+                        g_targetHand.load() ? 1 : 0);
                 ++s_gapp;
             }
             g_setupActorGlint(screenContext, entityContext, actor, &s_fill, &s_fill, &s_fill, &s_edge, uvOffset1,
@@ -557,6 +578,12 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_opacity.store(std::stof(std::string(value)), std::memory_order_relaxed);
         else if (key == "handOnly")
             g_handOnly.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "targetPlayers")
+            g_targetPlayers.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "targetMobs")
+            g_targetMobs.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "targetHand")
+            g_targetHand.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "boxEsp") {
             g_boxEsp.store(value == "true" || value == "1", std::memory_order_relaxed);
             if (g_boxEsp.load() && g_enabled.load()) installMatrixHook();
@@ -580,7 +607,9 @@ void registerModule() {
     b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.85", "0.05", "1.0", "");
-    b.config("handOnly", "Hand/items only", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("targetPlayers", "Players", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("targetMobs", "Mobs / other actors", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("targetHand", "Hand / items / cosmetics", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("boxEsp", "Box ESP", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("playersOnly", "ESP players only (off=players+mobs)", pl::modmenu::ConfigType::Toggle, "false", "",
              "", "");
