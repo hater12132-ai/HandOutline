@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -35,10 +36,16 @@ std::atomic_bool g_handOnly{false}; // false = allow world actors when targets e
 std::atomic_bool g_targetPlayers{true};
 std::atomic_bool g_targetMobs{true};   // non-player actors
 std::atomic_bool g_targetHand{true};   // FP hand / null actor (items, cosmetics-ish)
-std::atomic_bool g_skyShader{false};   // Lexora-style plasma/aurora on hand+items
-std::atomic<float> g_skySpeed{1.0f};   // animation speed
-std::atomic<float> g_skyOpacity{0.85f};
-std::atomic<int> g_skyMode{0}; // 0=plasma 1=aurora 2=midnight 3=nebula
+// Lexora-style hand effects (mutually: highest priority first if multiple on)
+std::atomic_bool g_fxPlasma{false};
+std::atomic_bool g_fxAurora{false};
+std::atomic_bool g_fxMidnight{false};
+std::atomic_bool g_fxNebula{false};
+std::atomic_bool g_fxFire{false};
+std::atomic_bool g_fxSnow{false};
+std::atomic_bool g_fxStars{false};
+std::atomic<float> g_fxSpeed{1.0f};
+std::atomic<float> g_fxOpacity{0.9f};
 std::atomic<int> g_fpSticky{0};
 std::atomic_bool g_boxEsp{false};
 std::atomic_bool g_playersOnly{true};
@@ -66,78 +73,81 @@ void logLine(const char* fmt, ...) {
 }
 
 
-// Lexora sky modes → bright animated colors for Color* path (hand/items only)
-Color skyChamsColor() {
+// Lexora hand_shader-ish + sky palettes — always bright (no near-black)
+static int activeFxMode() {
+    // priority order
+    if (g_fxPlasma.load(std::memory_order_relaxed)) return 0;
+    if (g_fxAurora.load(std::memory_order_relaxed)) return 1;
+    if (g_fxMidnight.load(std::memory_order_relaxed)) return 2;
+    if (g_fxNebula.load(std::memory_order_relaxed)) return 3;
+    if (g_fxFire.load(std::memory_order_relaxed)) return 4;
+    if (g_fxSnow.load(std::memory_order_relaxed)) return 5;
+    if (g_fxStars.load(std::memory_order_relaxed)) return 6;
+    return -1;
+}
+
+Color effectColor() {
     using clock = std::chrono::steady_clock;
     static const auto t0 = clock::now();
-    const float speed = g_skySpeed.load(std::memory_order_relaxed);
-    const float opac = g_skyOpacity.load(std::memory_order_relaxed);
-    const int mode = g_skyMode.load(std::memory_order_relaxed);
-    const double sec = std::chrono::duration<double>(clock::now() - t0).count();
-    const float t = static_cast<float>(sec) * speed;
+    const float speed = std::max(0.05f, g_fxSpeed.load(std::memory_order_relaxed));
+    const float opac = std::clamp(g_fxOpacity.load(std::memory_order_relaxed), 0.05f, 1.f);
+    const int mode = activeFxMode();
+    const float t = static_cast<float>(std::chrono::duration<double>(clock::now() - t0).count()) * speed;
 
-    float r = 1.f, g = 1.f, b = 1.f;
+    float r = 0.9f, g = 0.9f, b = 0.9f;
 
-    if (mode == 1) {
-        // aurora: green / cyan / magenta bands
+    if (mode == 0) { // plasma — pink/cyan
+        float f = 0.5f + 0.5f * std::sin(t * 1.3f);
+        float f2 = 0.5f + 0.5f * std::cos(t * 0.9f);
+        r = 0.55f + 0.45f * f;
+        g = 0.25f + 0.40f * f2;
+        b = 0.75f + 0.25f * (1.f - f);
+    } else if (mode == 1) { // aurora — green/cyan
         float w = 0.5f + 0.5f * std::sin(t * 1.4f);
         float w2 = 0.5f + 0.5f * std::sin(t * 0.9f + 1.7f);
-        r = 0.25f + 0.55f * w2;
-        g = 0.55f + 0.45f * w;
-        b = 0.70f + 0.30f * (1.f - w);
-    } else if (mode == 2) {
-        // midnight: deep blue + moon silver pulse
+        r = 0.35f + 0.40f * w2;
+        g = 0.75f + 0.25f * w;
+        b = 0.80f + 0.20f * (1.f - w);
+    } else if (mode == 2) { // midnight — blue/silver
         float star = 0.5f + 0.5f * std::sin(t * 2.2f);
-        r = 0.12f + 0.25f * star;
-        g = 0.18f + 0.30f * star;
-        b = 0.45f + 0.50f * star;
-    } else if (mode == 3) {
-        // nebula: purple / blue swirl
+        r = 0.35f + 0.35f * star;
+        g = 0.40f + 0.40f * star;
+        b = 0.75f + 0.25f * star;
+    } else if (mode == 3) { // nebula — purple/blue
         float f = 0.5f + 0.5f * std::sin(t * 1.1f);
         float f2 = 0.5f + 0.5f * std::cos(t * 0.7f);
-        r = 0.45f + 0.40f * f;
-        g = 0.15f + 0.25f * f2;
-        b = 0.70f + 0.30f * (1.f - f);
+        r = 0.60f + 0.35f * f;
+        g = 0.25f + 0.30f * f2;
+        b = 0.85f + 0.15f * (1.f - f);
+    } else if (mode == 4) { // fire — orange/red
+        float f = 0.5f + 0.5f * std::sin(t * 2.5f);
+        r = 0.95f;
+        g = 0.35f + 0.45f * f;
+        b = 0.10f + 0.15f * f;
+    } else if (mode == 5) { // snow — white/cyan sparkle
+        float f = 0.5f + 0.5f * std::sin(t * 3.0f);
+        r = 0.85f + 0.15f * f;
+        g = 0.90f + 0.10f * f;
+        b = 1.00f;
+    } else if (mode == 6) { // stars — gold/white flicker
+        float f = 0.5f + 0.5f * std::sin(t * 4.0f);
+        r = 0.90f + 0.10f * f;
+        g = 0.80f + 0.15f * f;
+        b = 0.50f + 0.40f * f;
     } else {
-        // plasma (default): violet → pink → cyan (Lexora plasma_sky, boosted)
-        float px = 3.f + t * 0.5f, py = 1.5f + t * 0.3f, pz = 2.f + t * 0.4f;
-        float flow = 0.f, amp = 1.f;
-        for (int i = 0; i < 5; ++i) {
-            flow += amp * std::fabs(std::sin(px) * std::cos(py) + std::sin(pz));
-            float nx = 0.36f * px + 0.48f * py - 0.80f * pz;
-            float ny = -0.80f * px + 0.60f * py;
-            float nz = 0.48f * px + 0.64f * py + 0.60f * pz;
-            px = nx * 1.3f; py = ny * 1.3f; pz = nz * 1.3f;
-            amp *= 0.6f;
-        }
-        float x = (flow - 0.5f) / 2.f;
-        if (x < 0.f) x = 0.f;
-        if (x > 1.f) x = 1.f;
-        flow = x * x * (3.f - 2.f * x);
-        // bright mix so it is not near-black
-        float bg[3] = {0.20f, 0.05f, 0.35f};
-        float c1[3] = {0.95f, 0.25f, 0.70f};
-        float c2[3] = {0.20f, 0.90f, 1.00f};
-        float col[3];
-        for (int i = 0; i < 3; ++i) col[i] = bg[i] + (c1[i] - bg[i]) * flow;
-        float hi = (flow - 0.5f) / 0.5f;
-        if (hi < 0.f) hi = 0.f;
-        if (hi > 1.f) hi = 1.f;
-        hi = hi * hi * (3.f - 2.f * hi);
-        for (int i = 0; i < 3; ++i) col[i] = col[i] + (c2[i] - col[i]) * hi;
-        r = col[0]; g = col[1]; b = col[2];
+        // no fx — return white high alpha (shouldn't be called)
+        return {1.f, 1.f, 1.f, opac};
     }
 
-    // floor brightness so RD doesn't read as black
-    const float floor = 0.15f;
-    if (r < floor) r = floor;
-    if (g < floor) g = floor;
-    if (b < floor) b = floor;
-    if (r > 1.f) r = 1.f;
-    if (g > 1.f) g = 1.f;
-    if (b > 1.f) b = 1.f;
+    // hard floor — never black
+    r = std::clamp(r, 0.35f, 1.f);
+    g = std::clamp(g, 0.35f, 1.f);
+    b = std::clamp(b, 0.35f, 1.f);
     return {r, g, b, opac};
 }
+
+bool anyFxOn() { return activeFxMode() >= 0; }
+
 
 
 void refresh() {
@@ -435,10 +445,9 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
     const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
     const int sticky = g_fpSticky.load(std::memory_order_acquire);
     const bool handWindow = fp || sticky > 0;
-    // Sky shader: tint all item/hand constant setups when enabled
-    // Otherwise: gate with targetHand + FP window
-    const bool skyOn = g_skyShader.load(std::memory_order_relaxed);
-    if (!skyOn && (!g_targetHand.load(std::memory_order_relaxed) || !handWindow)) {
+    // FX or normal chams: apply during hand window (or anytime FX wants item tint)
+    const bool fxOn = anyFxOn();
+    if (!fxOn && (!g_targetHand.load(std::memory_order_relaxed) || !handWindow)) {
         g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
                              overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
                              uvOffset2, uvRot1, uvRot2);
@@ -447,8 +456,8 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
     refresh();
     static Color s_fill{};
     static Color s_edge{};
-    if (g_skyShader.load(std::memory_order_relaxed)) {
-        s_fill = skyChamsColor();
+    if (anyFxOn()) {
+        s_fill = effectColor();
         s_edge = s_fill;
         s_edge.a = 1.f;
     } else {
@@ -456,7 +465,7 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
         s_edge = g_outline;
         s_edge.a = 1.f;
     }
-    const Color* tile = (handWindow ? &s_fill : tileLightColor);
+    const Color* tile = ((handWindow || fxOn) ? &s_fill : tileLightColor);
     static int s_app = 0;
     if (s_app < 12) {
         logLine("HandChams: APPLY #%d fp=%d sticky=%d", s_app, fp ? 1 : 0, sticky);
@@ -503,9 +512,9 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
         const bool handWin = fp || sticky > 0;
 
         bool doChams = false;
-        const bool skyOn = g_skyShader.load(std::memory_order_relaxed);
-        if (skyOn) {
-            // Sky is hand/items only — never player body/armor (those use real actor*)
+        const bool fxOn = anyFxOn();
+        if (fxOn) {
+            // FX is hand/items only — never player body/armor (those use real actor*)
             doChams = (actor == nullptr) || handWin;
         } else if (actor == nullptr) {
             doChams = g_targetHand.load(std::memory_order_relaxed);
@@ -528,8 +537,8 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
             refresh();
             static Color s_fill{};
             static Color s_edge{};
-            if (g_skyShader.load(std::memory_order_relaxed)) {
-                s_fill = skyChamsColor();
+            if (anyFxOn()) {
+                s_fill = effectColor();
                 s_edge = s_fill;
                 s_edge.a = 1.f;
                 s_edge.r = std::min(1.f, s_edge.r + 0.25f);
@@ -679,15 +688,25 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_targetMobs.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "targetHand")
             g_targetHand.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "skyShader")
-            g_skyShader.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "skySpeed")
-            g_skySpeed.store(std::stof(std::string(value)), std::memory_order_relaxed);
-        else if (key == "skyOpacity")
-            g_skyOpacity.store(std::stof(std::string(value)), std::memory_order_relaxed);
-        else if (key == "skyMode")
-            g_skyMode.store(static_cast<int>(std::stof(std::string(value))), std::memory_order_relaxed);
-        else if (key == "boxEsp") {
+        else if (key == "fxPlasma")
+            g_fxPlasma.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "fxAurora")
+            g_fxAurora.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "fxMidnight")
+            g_fxMidnight.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "fxNebula")
+            g_fxNebula.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "fxFire")
+            g_fxFire.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "fxSnow")
+            g_fxSnow.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "fxStars")
+            g_fxStars.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "fxSpeed")
+            g_fxSpeed.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        else if (key == "fxOpacity")
+            g_fxOpacity.store(std::stof(std::string(value)), std::memory_order_relaxed);
+                else if (key == "boxEsp") {
             g_boxEsp.store(value == "true" || value == "1", std::memory_order_relaxed);
             if (g_boxEsp.load() && g_enabled.load()) installMatrixHook();
         } else if (key == "playersOnly")
@@ -713,10 +732,16 @@ void registerModule() {
     b.config("targetPlayers", "Players", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetMobs", "Mobs / other actors", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetHand", "Hand / items / cosmetics", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
-    b.config("skyShader", "Lexora Sky on hand/items", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
-    b.config("skySpeed", "Sky speed", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.1", "5.0", "");
-    b.config("skyOpacity", "Sky opacity", pl::modmenu::ConfigType::SliderFloat, "0.85", "0.05", "1.0", "");
-    b.config("skyMode", "Sky mode 0=plasma 1=aurora 2=midnight 3=nebula", pl::modmenu::ConfigType::SliderFloat, "0", "0", "3", "");
+    b.config("fxPlasma", "Plasma", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("fxAurora", "Aurora", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("fxMidnight", "Midnight", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("fxNebula", "Nebula", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("fxFire", "Hand Fire", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("fxSnow", "Hand Snow", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("fxStars", "Hand Stars", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("fxSpeed", "Effect speed", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.1", "5.0", "");
+    b.config("fxOpacity", "Effect opacity", pl::modmenu::ConfigType::SliderFloat, "0.90", "0.2", "1.0", "");
+
     b.config("boxEsp", "Box ESP", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("playersOnly", "ESP players only (off=players+mobs)", pl::modmenu::ConfigType::Toggle, "false", "",
              "", "");
