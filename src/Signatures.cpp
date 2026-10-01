@@ -168,7 +168,8 @@ const std::array<SignatureDefinition, SignatureCount> definitions{{
     SignatureDefinition{SignatureId::ActorGetAttribute, "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? F9 F3 03 00 AA F4 03 01 AA ? ? ? F9 ? ? ? F8"},
     SignatureDefinition{SignatureId::AttributeInstanceGetCurrentValue, "? ? ? B0 ? ? ? 91 ? ? ? B9 C0 03 5F D6"},
     SignatureDefinition{SignatureId::AttributeInstanceGetMaxValue, "? ? ? B0 ? ? ? 91 ? ? ? B9 C0 03 5F D6 ? ? ? B0"},
-}};
+    SignatureDefinition{SignatureId::MaterialRegistryInit, "FD 7B BE A9 F4 4F 01 A9 FD 03 00 91 14 44 41 F9 F3 03 00 AA 88 D3 03 D0 08 C1 07 91 08 00 00 F9 B4 00 00 B4 81 22 00 91 00 00 80 92 86 EA 48 97 E0 00 00 B4 60 22 00 91"},
+};
 }
 
 bool resolveAll(std::string_view libraryName) {

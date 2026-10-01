@@ -42,6 +42,8 @@ void onSignaturesReady() {
     logLine("MaterialRE: MaterialBinPathBuilder %s @%p", mbin ? "OK" : "MISS", reinterpret_cast<void*>(mbin));
     logLine("MaterialRE: MaterialMissingError %s @%p", miss ? "OK" : "MISS", reinterpret_cast<void*>(miss));
     logLine("MaterialRE: RenderMaterialGroupCommon %s @%p", group ? "OK" : "MISS", reinterpret_cast<void*>(group));
+    const auto matreg = resolve(SignatureId::MaterialRegistryInit);
+    logLine("MaterialRE: MaterialRegistryInit (item_in_hand_glint+flat_color_line) %s @%p", matreg ? "OK" : "MISS", reinterpret_cast<void*>(matreg));
     logLine("MaterialRE: STOPPED experimental writes — a1 was not EDGE uniforms");
     logLine("MaterialRE: need MaterialFilter / custom material.bin bind for real chams");
 }

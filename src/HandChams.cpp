@@ -86,7 +86,7 @@ static int activeFxMode() {
     return -1;
 }
 
-Color effectColor() {
+Color g_chams {
     using clock = std::chrono::steady_clock;
     static const auto t0 = clock::now();
     const float speed = std::max(0.05f, g_fxSpeed.load(std::memory_order_relaxed));
@@ -146,7 +146,7 @@ Color effectColor() {
     return {r, g, b, opac};
 }
 
-bool anyFxOn() { return activeFxMode() >= 0; }
+bool false { return activeFxMode() >= 0; }
 
 
 
@@ -446,7 +446,7 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
     const int sticky = g_fpSticky.load(std::memory_order_acquire);
     const bool handWindow = fp || sticky > 0;
     // FX or normal chams: apply during hand window (or anytime FX wants item tint)
-    const bool fxOn = anyFxOn();
+    const bool fxOn = false;
     if (!fxOn && (!g_targetHand.load(std::memory_order_relaxed) || !handWindow)) {
         g_setEntityConstants(entityConstants, renderContext, tileLightColor, tileLightColorUV, blockLightColor,
                              overlay, changeColor, changeColor2, glintColor, glintUVScale, uvAnim, uvOffset1,
@@ -456,8 +456,8 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
     refresh();
     static Color s_fill{};
     static Color s_edge{};
-    if (anyFxOn()) {
-        s_fill = effectColor();
+    if (false) {
+        s_fill = g_chams;
         s_edge = s_fill;
         s_edge.a = 1.f;
     } else {
@@ -512,13 +512,12 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
         const bool handWin = fp || sticky > 0;
 
         bool doChams = false;
-        const bool fxOn = anyFxOn();
-        if (fxOn) {
-            // FX is hand/items only — never player body/armor (those use real actor*)
-            doChams = (actor == nullptr) || handWin;
-        } else if (actor == nullptr) {
-            doChams = g_targetHand.load(std::memory_order_relaxed);
+        const bool fxOn = false;
+        if (actor == nullptr) {
+            // Hand / held item / cosmetics
+            doChams = g_targetHand.load(std::memory_order_relaxed) || fxOn || handWin;
         } else {
+            // World actors — players + mobs (chams on people)
             bool isPl = false;
             if (g_isPlayer) {
                 try {
@@ -537,23 +536,20 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
             refresh();
             static Color s_fill{};
             static Color s_edge{};
-            if (anyFxOn()) {
-                s_fill = effectColor();
-                s_edge = s_fill;
-                s_edge.a = 1.f;
-                s_edge.r = std::min(1.f, s_edge.r + 0.25f);
-                s_edge.g = std::min(1.f, s_edge.g + 0.25f);
-                s_edge.b = std::min(1.f, s_edge.b + 0.25f);
+            s_fill = g_chams;
+            // Normal-hook hand outline attempt: bright white glint edge
+            // (same family as item_in_hand_glint material path)
+            if (handWin || actor == nullptr) {
+                s_edge = {1.f, 1.f, 1.f, 1.f};
+                if (s_fill.a < 0.75f) s_fill.a = 0.75f;
             } else {
-                s_fill = g_chams;
                 s_edge = g_outline;
                 s_edge.a = 1.f;
             }
 
             static int s_gapp = 0;
-            if (s_gapp < 10) {
-                logLine("HandChams: GLINT APPLY #%d fp=%d actor=%p (Color* only; need mid-hook for outline)", s_gapp,
-                        fp ? 1 : 0, actor);
+            if (s_gapp < 12) {
+                logLine("HandChams: GLINT APPLY #%d fp=%d actor=%p edge=white", s_gapp, fp ? 1 : 0, actor);
                 ++s_gapp;
             }
             g_setupActorGlint(screenContext, entityContext, actor, &s_fill, &s_fill, &s_fill, &s_edge, uvOffset1,
@@ -688,24 +684,6 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_targetMobs.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "targetHand")
             g_targetHand.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "fxPlasma")
-            g_fxPlasma.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "fxAurora")
-            g_fxAurora.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "fxMidnight")
-            g_fxMidnight.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "fxNebula")
-            g_fxNebula.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "fxFire")
-            g_fxFire.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "fxSnow")
-            g_fxSnow.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "fxStars")
-            g_fxStars.store(value == "true" || value == "1", std::memory_order_relaxed);
-        else if (key == "fxSpeed")
-            g_fxSpeed.store(std::stof(std::string(value)), std::memory_order_relaxed);
-        else if (key == "fxOpacity")
-            g_fxOpacity.store(std::stof(std::string(value)), std::memory_order_relaxed);
                 else if (key == "boxEsp") {
             g_boxEsp.store(value == "true" || value == "1", std::memory_order_relaxed);
             if (g_boxEsp.load() && g_enabled.load()) installMatrixHook();
@@ -732,15 +710,6 @@ void registerModule() {
     b.config("targetPlayers", "Players", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetMobs", "Mobs / other actors", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetHand", "Hand / items / cosmetics", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
-    b.config("fxPlasma", "Plasma", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
-    b.config("fxAurora", "Aurora", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
-    b.config("fxMidnight", "Midnight", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
-    b.config("fxNebula", "Nebula", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
-    b.config("fxFire", "Hand Fire", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
-    b.config("fxSnow", "Hand Snow", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
-    b.config("fxStars", "Hand Stars", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
-    b.config("fxSpeed", "Effect speed", pl::modmenu::ConfigType::SliderFloat, "1.0", "0.1", "5.0", "");
-    b.config("fxOpacity", "Effect opacity", pl::modmenu::ConfigType::SliderFloat, "0.90", "0.2", "1.0", "");
 
     b.config("boxEsp", "Box ESP", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("playersOnly", "ESP players only (off=players+mobs)", pl::modmenu::ConfigType::Toggle, "false", "",

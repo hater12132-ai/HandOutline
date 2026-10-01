@@ -144,6 +144,7 @@ enum class SignatureId : std::uint16_t {
     ActorGetAttribute,
     AttributeInstanceGetCurrentValue,
     AttributeInstanceGetMaxValue,
+    MaterialRegistryInit,
     Count
 };
 
