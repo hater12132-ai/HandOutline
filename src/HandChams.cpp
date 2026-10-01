@@ -36,16 +36,6 @@ std::atomic_bool g_handOnly{false}; // false = allow world actors when targets e
 std::atomic_bool g_targetPlayers{true};
 std::atomic_bool g_targetMobs{true};   // non-player actors
 std::atomic_bool g_targetHand{true};   // FP hand / null actor (items, cosmetics-ish)
-// Lexora-style hand effects (mutually: highest priority first if multiple on)
-std::atomic_bool g_fxPlasma{false};
-std::atomic_bool g_fxAurora{false};
-std::atomic_bool g_fxMidnight{false};
-std::atomic_bool g_fxNebula{false};
-std::atomic_bool g_fxFire{false};
-std::atomic_bool g_fxSnow{false};
-std::atomic_bool g_fxStars{false};
-std::atomic<float> g_fxSpeed{1.0f};
-std::atomic<float> g_fxOpacity{0.9f};
 std::atomic<int> g_fpSticky{0};
 std::atomic_bool g_boxEsp{false};
 std::atomic_bool g_playersOnly{true};
@@ -71,82 +61,6 @@ void logLine(const char* fmt, ...) {
     bactro::statusLine(buf);
     HC_LOGI("%s", buf);
 }
-
-
-// Lexora hand_shader-ish + sky palettes — always bright (no near-black)
-static int activeFxMode() {
-    // priority order
-    if (g_fxPlasma.load(std::memory_order_relaxed)) return 0;
-    if (g_fxAurora.load(std::memory_order_relaxed)) return 1;
-    if (g_fxMidnight.load(std::memory_order_relaxed)) return 2;
-    if (g_fxNebula.load(std::memory_order_relaxed)) return 3;
-    if (g_fxFire.load(std::memory_order_relaxed)) return 4;
-    if (g_fxSnow.load(std::memory_order_relaxed)) return 5;
-    if (g_fxStars.load(std::memory_order_relaxed)) return 6;
-    return -1;
-}
-
-Color g_chams {
-    using clock = std::chrono::steady_clock;
-    static const auto t0 = clock::now();
-    const float speed = std::max(0.05f, g_fxSpeed.load(std::memory_order_relaxed));
-    const float opac = std::clamp(g_fxOpacity.load(std::memory_order_relaxed), 0.05f, 1.f);
-    const int mode = activeFxMode();
-    const float t = static_cast<float>(std::chrono::duration<double>(clock::now() - t0).count()) * speed;
-
-    float r = 0.9f, g = 0.9f, b = 0.9f;
-
-    if (mode == 0) { // plasma — pink/cyan
-        float f = 0.5f + 0.5f * std::sin(t * 1.3f);
-        float f2 = 0.5f + 0.5f * std::cos(t * 0.9f);
-        r = 0.55f + 0.45f * f;
-        g = 0.25f + 0.40f * f2;
-        b = 0.75f + 0.25f * (1.f - f);
-    } else if (mode == 1) { // aurora — green/cyan
-        float w = 0.5f + 0.5f * std::sin(t * 1.4f);
-        float w2 = 0.5f + 0.5f * std::sin(t * 0.9f + 1.7f);
-        r = 0.35f + 0.40f * w2;
-        g = 0.75f + 0.25f * w;
-        b = 0.80f + 0.20f * (1.f - w);
-    } else if (mode == 2) { // midnight — blue/silver
-        float star = 0.5f + 0.5f * std::sin(t * 2.2f);
-        r = 0.35f + 0.35f * star;
-        g = 0.40f + 0.40f * star;
-        b = 0.75f + 0.25f * star;
-    } else if (mode == 3) { // nebula — purple/blue
-        float f = 0.5f + 0.5f * std::sin(t * 1.1f);
-        float f2 = 0.5f + 0.5f * std::cos(t * 0.7f);
-        r = 0.60f + 0.35f * f;
-        g = 0.25f + 0.30f * f2;
-        b = 0.85f + 0.15f * (1.f - f);
-    } else if (mode == 4) { // fire — orange/red
-        float f = 0.5f + 0.5f * std::sin(t * 2.5f);
-        r = 0.95f;
-        g = 0.35f + 0.45f * f;
-        b = 0.10f + 0.15f * f;
-    } else if (mode == 5) { // snow — white/cyan sparkle
-        float f = 0.5f + 0.5f * std::sin(t * 3.0f);
-        r = 0.85f + 0.15f * f;
-        g = 0.90f + 0.10f * f;
-        b = 1.00f;
-    } else if (mode == 6) { // stars — gold/white flicker
-        float f = 0.5f + 0.5f * std::sin(t * 4.0f);
-        r = 0.90f + 0.10f * f;
-        g = 0.80f + 0.15f * f;
-        b = 0.50f + 0.40f * f;
-    } else {
-        // no fx — return white high alpha (shouldn't be called)
-        return {1.f, 1.f, 1.f, opac};
-    }
-
-    // hard floor — never black
-    r = std::clamp(r, 0.35f, 1.f);
-    g = std::clamp(g, 0.35f, 1.f);
-    b = std::clamp(b, 0.35f, 1.f);
-    return {r, g, b, opac};
-}
-
-bool false { return activeFxMode() >= 0; }
 
 
 
