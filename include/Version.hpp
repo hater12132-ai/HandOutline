@@ -3,7 +3,7 @@
 namespace bactro {
 inline constexpr std::string_view Name = "BactroNative";
 inline constexpr std::string_view Author = "hater12132-ai";
-inline constexpr std::string_view Description = "Remove broken Lexora leftovers in HandChams; sig braces OK.";
-inline constexpr std::string_view Version = "1.20.4";
+inline constexpr std::string_view Description = "Hand outline push: ItemInHand setup arm + forced white edge on constants/glint.";
+inline constexpr std::string_view Version = "1.22.0";
 inline constexpr std::string_view Library = "libBactroNative.so";
 }

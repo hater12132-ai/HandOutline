@@ -11,6 +11,7 @@
 #include <dlfcn.h>
 
 #include <atomic>
+#include <cstdint>
 #include <cmath>
 #include <algorithm>
 #include <cstdarg>
@@ -329,7 +330,7 @@ RenderFirstPersonFn g_renderFpOriginal = nullptr;
 void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5) {
     if (!g_renderFpOriginal) return;
     bactro::phase::inFirstPersonHand.store(true, std::memory_order_release);
-    g_fpSticky.store(8, std::memory_order_release); // keep APPLY window for following constant setup
+    g_fpSticky.store(32, std::memory_order_release); // longer window for constants + glint + edge
     g_renderFpOriginal(self, a1, a2, a3, a4, a5);
 }
 
@@ -368,24 +369,22 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
         return;
     }
     refresh();
+    // Aggressive hand force: fill + edge + overlay all bright (outline-like glint family)
     static Color s_fill{};
     static Color s_edge{};
-    if (false) {
-        s_fill = g_chams;
-        s_edge = s_fill;
-        s_edge.a = 1.f;
-    } else {
-        s_fill = g_chams;
-        s_edge = g_outline;
-        s_edge.a = 1.f;
-    }
-    const Color* tile = ((handWindow || fxOn) ? &s_fill : tileLightColor);
+    static Color s_white{};
+    s_fill = g_chams;
+    if (s_fill.a < 0.85f) s_fill.a = 0.85f;
+    s_edge = {1.f, 1.f, 1.f, 1.f};
+    s_white = {1.f, 1.f, 1.f, 1.f};
+    const Color* tile = &s_fill;
     static int s_app = 0;
-    if (s_app < 12) {
-        logLine("HandChams: APPLY #%d fp=%d sticky=%d", s_app, fp ? 1 : 0, sticky);
+    if (s_app < 16) {
+        logLine("HandChams: CONST APPLY #%d fp=%d sticky=%d (forced white edge)", s_app, fp ? 1 : 0, sticky);
         ++s_app;
     }
-    g_setEntityConstants(entityConstants, renderContext, tile, tileLightColorUV, blockLightColor, &s_fill, &s_fill,
+    // overlay/changeColor/glint all forced — max chance RD shows hand tint
+    g_setEntityConstants(entityConstants, renderContext, tile, tileLightColorUV, blockLightColor, &s_white, &s_fill,
                          &s_fill, &s_edge, glintUVScale, uvAnim, uvOffset1, uvOffset2, uvRot1, uvRot2);
 }
 
@@ -480,7 +479,24 @@ void setupGlintDetour(void* screenContext, void* entityContext, void* actor, con
                       const Color* changeColor, const Color* changeColor2, const Color* glintColor, float uvOffset1,
                       float uvOffset2, float uvRot1, float uvRot2, const void* lightEmissionColor) {
     if (!g_setupGlint) return;
-    // Passthrough only — same crash class as setupActorGlint when colors replaced
+    const bool en = g_enabled.load(std::memory_order_relaxed);
+    const bool handWin = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire) ||
+                         g_fpSticky.load(std::memory_order_acquire) > 0;
+    if (en && g_targetHand.load(std::memory_order_relaxed) && (handWin || actor == nullptr)) {
+        refresh();
+        static Color fill{}, edge{};
+        fill = g_chams;
+        if (fill.a < 0.85f) fill.a = 0.85f;
+        edge = {1.f, 1.f, 1.f, 1.f};
+        static int n = 0;
+        if (n < 10) {
+            logLine("HandChams: SETUP_GLINT APPLY #%d (hand outline attempt)", n);
+            ++n;
+        }
+        g_setupGlint(screenContext, entityContext, actor, &fill, &fill, &fill, &edge, uvOffset1, uvOffset2, uvRot1,
+                     uvRot2, lightEmissionColor);
+        return;
+    }
     g_setupGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor, uvOffset1,
                  uvOffset2, uvRot1, uvRot2, lightEmissionColor);
 }
@@ -498,6 +514,27 @@ void setupFoilDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5,
     }
     // Always call through — foil is enchanted-item path; still useful signal
     g_setupFoil(a0, a1, a2, a3, a4, a5, a6, a7);
+}
+
+
+
+// ItemInHandShaderSetup — arm FP window (6-arg safe pass-through, matches renderFirstPerson style)
+using ItemInHandSetupFn = void (*)(void*, void*, void*, void*, void*, void*);
+ItemInHandSetupFn g_itemHandSetup = nullptr;
+bool g_itemHandHooked = false;
+
+void itemInHandSetupDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5) {
+    if (!g_itemHandSetup) return;
+    if (g_enabled.load(std::memory_order_relaxed) && g_targetHand.load(std::memory_order_relaxed)) {
+        bactro::phase::inFirstPersonHand.store(true, std::memory_order_release);
+        g_fpSticky.store(32, std::memory_order_release);
+        static int n = 0;
+        if (n < 8) {
+            logLine("HandChams: ItemInHandShaderSetup #%d FP armed", n);
+            ++n;
+        }
+    }
+    g_itemHandSetup(a0, a1, a2, a3, a4, a5);
 }
 
 void tryInstallHooks() {
@@ -524,6 +561,19 @@ void tryInstallHooks() {
             logLine("HandChams: renderFirstPerson hooked");
         } else
             logLine("HandChams: renderFirstPerson FAIL");
+
+    if (!g_itemHandHooked) {
+        void* o = nullptr;
+        if (bactro::memory::hook(bactro::memory::SignatureId::ItemInHandShaderSetup,
+                                 reinterpret_cast<void*>(&itemInHandSetupDetour), &o) &&
+            o) {
+            g_itemHandSetup = reinterpret_cast<ItemInHandSetupFn>(o);
+            g_itemHandHooked = true;
+            logLine("HandChams: ItemInHandShaderSetup hooked");
+        } else
+            logLine("HandChams: ItemInHandShaderSetup FAIL");
+    }
+
     }
     if (!g_hookedEntity) {
         o = nullptr;
@@ -569,9 +619,7 @@ void tryInstallHooks() {
         } else
             logLine("HandChams: setupFoil FAIL");
     }
-    logLine("SnowChams: hooks fp=%d entity=%d actor=%d glint=%d foil=%d matrix=%d", g_renderFpHooked ? 1 : 0,
-            g_hookedEntity ? 1 : 0, g_hookedActor ? 1 : 0, g_hookedGlint ? 1 : 0, g_hookedFoil ? 1 : 0,
-            g_glUniformHooked ? 1 : 0);
+    logLine("SnowChams: hooks fp=%d entity=%d actor=%d glint=%d foil=%d itemHand=%d matrix=%d", g_renderFpHooked ? 1 : 0, g_hookedEntity ? 1 : 0, g_hookedActor ? 1 : 0, g_hookedGlint ? 1 : 0, g_hookedFoil ? 1 : 0, g_itemHandHooked ? 1 : 0, g_glUniformHooked ? 1 : 0);
 }
 
 void onToggle(std::string_view, bool enabled) {
