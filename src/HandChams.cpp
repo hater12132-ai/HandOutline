@@ -678,7 +678,6 @@ void tryInstallHooks() {
 
     // Matrix hook only if box ESP wanted (avoids extra work / crash surface on launch)
     if (g_boxEsp.load(std::memory_order_relaxed)) installMatrixHook();
-    if (g_boxEsp.load(std::memory_order_relaxed)) /* installDrawElementsHook moved to EntityOutline module */
 
     if (!g_renderFpHooked) {
         o = nullptr;
@@ -757,7 +756,6 @@ void onToggle(std::string_view, bool enabled) {
     if (enabled) {
         tryInstallHooks();
         if (g_boxEsp.load(std::memory_order_relaxed)) installMatrixHook();
-    if (g_boxEsp.load(std::memory_order_relaxed)) /* installDrawElementsHook moved to EntityOutline module */
     }
 }
 
@@ -783,7 +781,6 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_boxEsp.store(value == "true" || value == "1", std::memory_order_relaxed);
             if (g_boxEsp.load() && g_enabled.load()) {
                 installMatrixHook();
-                /* installDrawElementsHook moved to EntityOutline module */
             }
         } else if (key == "playersOnly")
             g_playersOnly.store(value == "true" || value == "1", std::memory_order_relaxed);
