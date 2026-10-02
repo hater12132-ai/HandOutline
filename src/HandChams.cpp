@@ -63,8 +63,6 @@ void logLine(const char* fmt, ...) {
     HC_LOGI("%s", buf);
 }
 
-
-
 void refresh() {
     float aa = g_opacity.load(std::memory_order_relaxed);
     if (aa < 0.05f) aa = 0.05f;
@@ -79,6 +77,69 @@ void* glProc(const char* name) {
     if (!h) h = dlopen("libGLESv3.so", RTLD_NOW);
     return h ? dlsym(h, name) : nullptr;
 }
+
+
+// Entity Outline style: second pass glDrawElements as GL_LINES (mesh edges / wire)
+using PFN_glDrawElements = void (*)(unsigned int, int, unsigned int, const void*);
+using PFN_glDepthMask = void (*)(unsigned char);
+PFN_glDrawElements g_glDrawElementsOrig = nullptr;
+PFN_glDepthMask d_glDepthMask = nullptr;
+bool g_drawElementsHooked = false;
+std::atomic_int g_wireDraws{0};
+
+void glDrawElementsDetour(unsigned int mode, int count, unsigned int type, const void* indices) {
+    if (g_glDrawElementsOrig)
+        g_glDrawElementsOrig(mode, count, type, indices);
+    // Only while entity mesh is being submitted (armed from setupActorGlint)
+    if (!g_enabled.load(std::memory_order_relaxed) || !g_boxEsp.load(std::memory_order_relaxed))
+        return;
+    if (!g_entityRenderArmed.load(std::memory_order_acquire))
+        return;
+    // GL_TRIANGLES = 0x0004
+    if (mode != 0x0004u) return;
+    if (count < 6 || count > 200000) return;
+    if (!g_glDrawElementsOrig) return;
+    if (d_glLineWidth) d_glLineWidth(2.5f);
+    if (d_glDepthMask) d_glDepthMask(0);
+    if (d_glEnable) d_glEnable(0x0BE2); // GL_BLEND
+    if (d_glBlendFunc) d_glBlendFunc(0x0302, 0x0303); // SRC_ALPHA, ONE_MINUS_SRC_ALPHA
+    // Draw same index buffer as lines — cheap wireframe-style outline (Entity Outline family)
+    g_glDrawElementsOrig(0x0001u /*GL_LINES*/, count, type, indices);
+    if (d_glDepthMask) d_glDepthMask(1);
+    g_wireDraws.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool loadLineGl(); // fwd
+bool installDrawElementsHook() {
+    if (g_drawElementsHooked) return true;
+    void* p = glProc("glDrawElements");
+    if (!p) {
+        void* egl = dlopen("libEGL.so", RTLD_NOW);
+        if (egl) {
+            using EglGPA = void* (*)(const char*);
+            auto gpa = reinterpret_cast<EglGPA>(dlsym(egl, "eglGetProcAddress"));
+            if (gpa) p = gpa("glDrawElements");
+        }
+    }
+    if (!p) {
+        logLine("EntityOutline: glDrawElements not found");
+        return false;
+    }
+    void* o = nullptr;
+    if (pl::memory::hook(p, reinterpret_cast<void*>(&glDrawElementsDetour), &o) != 0 || !o) {
+        // try alternate - some loaders return non-zero on success differently
+        logLine("EntityOutline: glDrawElements HOOK FAIL");
+        return false;
+    }
+    g_glDrawElementsOrig = reinterpret_cast<PFN_glDrawElements>(o);
+    d_glDepthMask = reinterpret_cast<PFN_glDepthMask>(glProc("glDepthMask"));
+    loadLineGl(); // resolve glLineWidth / blend
+    g_drawElementsHooked = true;
+    logLine("EntityOutline: glDrawElements HOOKED (wire pass on entity mesh)");
+    return true;
+}
+
+
 
 // ---- Optional box ESP (off by default; players only) ----
 struct Box {
@@ -557,6 +618,7 @@ void tryInstallHooks() {
 
     // Matrix hook only if box ESP wanted (avoids extra work / crash surface on launch)
     if (g_boxEsp.load(std::memory_order_relaxed)) installMatrixHook();
+    if (g_boxEsp.load(std::memory_order_relaxed)) installDrawElementsHook();
 
     if (!g_renderFpHooked) {
         o = nullptr;
@@ -635,6 +697,7 @@ void onToggle(std::string_view, bool enabled) {
     if (enabled) {
         tryInstallHooks();
         if (g_boxEsp.load(std::memory_order_relaxed)) installMatrixHook();
+    if (g_boxEsp.load(std::memory_order_relaxed)) installDrawElementsHook();
     }
 }
 
@@ -658,7 +721,10 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_targetHand.store(value == "true" || value == "1", std::memory_order_relaxed);
                 else if (key == "boxEsp") {
             g_boxEsp.store(value == "true" || value == "1", std::memory_order_relaxed);
-            if (g_boxEsp.load() && g_enabled.load()) installMatrixHook();
+            if (g_boxEsp.load() && g_enabled.load()) {
+                installMatrixHook();
+                installDrawElementsHook();
+            }
         } else if (key == "playersOnly")
             g_playersOnly.store(value == "true" || value == "1", std::memory_order_relaxed);
         refresh();
@@ -700,6 +766,12 @@ void shutdown() { g_enabled.store(false, std::memory_order_release); }
 
 void onPostFrame() {
     if (g_enabled.load(std::memory_order_relaxed)) drawBoxEsp();
+    static int s_wlog = 0;
+    const int wd = g_wireDraws.exchange(0, std::memory_order_relaxed);
+    if (wd > 0 && s_wlog < 10) {
+        logLine("EntityOutline: wire draws this frame=%d", wd);
+        ++s_wlog;
+    }
     g_entityRenderArmed.store(false, std::memory_order_release);
     bactro::phase::inFirstPersonHand.store(false, std::memory_order_release);
     {
