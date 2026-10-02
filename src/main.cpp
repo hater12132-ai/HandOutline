@@ -1,6 +1,8 @@
 #include "bactro/Signatures.hpp"
 #include "bactro/MotionBlur.hpp"
 #include "bactro/HandChams.hpp"
+#include "bactro/ChamsESP.hpp"
+#include "bactro/EntityOutline.hpp"
 #include "bactro/MaterialProbe.hpp"
 #include "bactro/Status.hpp"
 #include "Version.hpp"
@@ -185,6 +187,8 @@ void resolveEverythingAsync() {
         installTickHook();
                 bactro::motionblur::onSignaturesReady();
                         bactro::handchams::onSignaturesReady();
+    bactro::chamsesp::onSignaturesReady();
+    bactro::entityoutline::onSignaturesReady();
     bactro::material::onSignaturesReady();
                 writeStatus("async init finished");
     }).detach();
@@ -241,6 +245,8 @@ void registerMenus() {
     }
     bactro::motionblur::registerModule();
     bactro::handchams::registerModule();
+    bactro::chamsesp::registerModule();
+    bactro::entityoutline::registerModule();
 }
 
 } // namespace
@@ -276,6 +282,8 @@ public:
         onPerfToggle("", false);
                 bactro::motionblur::shutdown();
                                 bactro::handchams::shutdown();
+                                bactro::chamsesp::shutdown();
+                                bactro::entityoutline::shutdown();
         return true;
     }
 
@@ -283,6 +291,8 @@ public:
         onPerfToggle("", false);
                 bactro::motionblur::shutdown();
                                 bactro::handchams::shutdown();
+                                bactro::chamsesp::shutdown();
+                                bactro::entityoutline::shutdown();
         return true;
     }
 };

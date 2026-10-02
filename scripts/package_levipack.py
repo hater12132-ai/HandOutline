@@ -17,7 +17,7 @@ def main() -> int:
         "type": "preload-native",
         "name": "BactroNative",
         "author": "hater12132-ai",
-        "version": "1.24.2",
+        "version": "1.26.0",
         "entry": "libBactroNative.so",
         "icon": "icon.png",
         "minecraft_versions": [
