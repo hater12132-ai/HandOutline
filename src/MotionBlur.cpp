@@ -1,5 +1,6 @@
 #include "bactro/MotionBlur.hpp"
 #include "bactro/HandChams.hpp"
+#include "bactro/EntityOutline.hpp"
 #include "bactro/Status.hpp"
 
 #include <pl/ModMenu.hpp>
@@ -419,6 +420,7 @@ EGLBoolean swapDetour(EGLDisplay dpy, EGLSurface surface) {
     }
     try {
         bactro::handchams::onPostFrame();
+        bactro::entityoutline::onPostFrame();
     } catch (...) {
     }
     return g_swapOriginal ? g_swapOriginal(dpy, surface) : EGL_FALSE;
