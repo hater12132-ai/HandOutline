@@ -59,9 +59,9 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
 
     bool apply = true;
     if (g_playersOnly.load(std::memory_order_relaxed)) {
-        if (!g_isPlayer)
+        if (!g_isPlayer) {
             apply = false;
-        else {
+        } else {
             try {
                 apply = g_isPlayer(actor);
             } catch (...) {
@@ -79,22 +79,14 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
     static Color fill{}, edge{};
     fill = {g_r.load(std::memory_order_relaxed), g_g.load(std::memory_order_relaxed),
             g_b.load(std::memory_order_relaxed), g_a.load(std::memory_order_relaxed)};
-    edge = fill;
-    edge.a = 1.f;
-
-    static int n = 0;
-    if (n < 8) {
-        logLine("ChamsESP: APPLY #%d actor=%p (visible, no wallhack)", n, actor);
-        ++n;
-    }
-
+    edge = {1.f, 1.f, 1.f, 1.f};
     g_setupActorGlint(screenContext, entityContext, actor, &fill, &fill, &fill, &edge, uvOffset1, uvOffset2, uvRot1,
                       uvRot2, lightEmissionColor);
 }
 
 void tryInstall() {
     if (!g_isPlayer) {
-        auto addr = bactro::memory::resolve(bactro::memory::SignatureId::ActorIsPlayer);
+        const auto addr = bactro::memory::resolve(bactro::memory::SignatureId::ActorIsPlayer);
         if (addr) {
             g_isPlayer = reinterpret_cast<ActorIsPlayerFn>(addr);
             logLine("ChamsESP: ActorIsPlayer @%p", reinterpret_cast<void*>(addr));
@@ -114,13 +106,15 @@ void tryInstall() {
     }
 }
 
-void onToggle(bool on) {
+// MUST match pl::modmenu: (std::string_view, bool) — NOT (bool)
+void onToggle(std::string_view, bool on) {
     g_enabled.store(on, std::memory_order_relaxed);
     if (on) tryInstall();
     logLine(on ? "ChamsESP ON" : "ChamsESP OFF");
 }
 
-void onConfig(std::string_view key, std::string_view value) {
+// MUST match pl::modmenu: (std::string_view, std::string_view, std::string_view)
+void onConfig(std::string_view, std::string_view key, std::string_view value) {
     try {
         if (key == "r")
             g_r.store(std::stof(std::string(value)), std::memory_order_relaxed);
