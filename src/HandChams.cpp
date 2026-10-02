@@ -38,7 +38,10 @@ std::atomic_bool g_targetPlayers{true};
 std::atomic_bool g_targetMobs{true};   // non-player actors
 std::atomic_bool g_targetHand{true};   // FP hand / null actor (items, cosmetics-ish)
 std::atomic<int> g_fpSticky{0};
-std::atomic_bool g_boxEsp{true}; // Solstice box ESP default on
+std::atomic_bool g_boxEsp{true}; // Solstice box ESP / entity wire outline
+std::atomic<float> g_outlineWidth{2.5f};   // glLineWidth
+std::atomic<float> g_outlineGlow{0.6f};    // extra glow passes (0=off, 1=strong)
+std::atomic<float> g_outlineAlpha{0.95f};  // line alpha
 std::atomic_bool g_playersOnly{true};
 std::atomic<float> g_r{1.00f};
 std::atomic<float> g_g{1.00f};
@@ -77,68 +80,6 @@ void* glProc(const char* name) {
     if (!h) h = dlopen("libGLESv3.so", RTLD_NOW);
     return h ? dlsym(h, name) : nullptr;
 }
-
-
-// Entity Outline style: second pass glDrawElements as GL_LINES (mesh edges / wire)
-using PFN_glDrawElements = void (*)(unsigned int, int, unsigned int, const void*);
-using PFN_glDepthMask = void (*)(unsigned char);
-PFN_glDrawElements g_glDrawElementsOrig = nullptr;
-PFN_glDepthMask d_glDepthMask = nullptr;
-bool g_drawElementsHooked = false;
-std::atomic_int g_wireDraws{0};
-
-void glDrawElementsDetour(unsigned int mode, int count, unsigned int type, const void* indices) {
-    if (g_glDrawElementsOrig)
-        g_glDrawElementsOrig(mode, count, type, indices);
-    // Only while entity mesh is being submitted (armed from setupActorGlint)
-    if (!g_enabled.load(std::memory_order_relaxed) || !g_boxEsp.load(std::memory_order_relaxed))
-        return;
-    if (!g_entityRenderArmed.load(std::memory_order_acquire))
-        return;
-    // GL_TRIANGLES = 0x0004
-    if (mode != 0x0004u) return;
-    if (count < 6 || count > 200000) return;
-    if (!g_glDrawElementsOrig) return;
-    if (d_glLineWidth) d_glLineWidth(2.5f);
-    if (d_glDepthMask) d_glDepthMask(0);
-    if (d_glEnable) d_glEnable(0x0BE2); // GL_BLEND
-    if (d_glBlendFunc) d_glBlendFunc(0x0302, 0x0303); // SRC_ALPHA, ONE_MINUS_SRC_ALPHA
-    // Draw same index buffer as lines — cheap wireframe-style outline (Entity Outline family)
-    g_glDrawElementsOrig(0x0001u /*GL_LINES*/, count, type, indices);
-    if (d_glDepthMask) d_glDepthMask(1);
-    g_wireDraws.fetch_add(1, std::memory_order_relaxed);
-}
-
-bool loadLineGl(); // fwd
-bool installDrawElementsHook() {
-    if (g_drawElementsHooked) return true;
-    void* p = glProc("glDrawElements");
-    if (!p) {
-        void* egl = dlopen("libEGL.so", RTLD_NOW);
-        if (egl) {
-            using EglGPA = void* (*)(const char*);
-            auto gpa = reinterpret_cast<EglGPA>(dlsym(egl, "eglGetProcAddress"));
-            if (gpa) p = gpa("glDrawElements");
-        }
-    }
-    if (!p) {
-        logLine("EntityOutline: glDrawElements not found");
-        return false;
-    }
-    void* o = nullptr;
-    if (pl::memory::hook(p, reinterpret_cast<void*>(&glDrawElementsDetour), &o) != 0 || !o) {
-        // try alternate - some loaders return non-zero on success differently
-        logLine("EntityOutline: glDrawElements HOOK FAIL");
-        return false;
-    }
-    g_glDrawElementsOrig = reinterpret_cast<PFN_glDrawElements>(o);
-    d_glDepthMask = reinterpret_cast<PFN_glDepthMask>(glProc("glDepthMask"));
-    loadLineGl(); // resolve glLineWidth / blend
-    g_drawElementsHooked = true;
-    logLine("EntityOutline: glDrawElements HOOKED (wire pass on entity mesh)");
-    return true;
-}
-
 
 
 // ---- Optional box ESP (off by default; players only) ----
@@ -329,6 +270,120 @@ bool loadLineGl() {
     return g_lineGlReady;
 }
 
+
+// ---- Entity Outline style: glDrawElements wire + glow (width/glow controllable) ----
+using PFN_glDrawElements = void (*)(unsigned int, int, unsigned int, const void*);
+using PFN_glDepthMask = void (*)(unsigned char);
+PFN_glDrawElements g_glDrawElementsOrig = nullptr;
+PFN_glDepthMask d_glDepthMask = nullptr;
+bool g_drawElementsHooked = false;
+std::atomic_int g_wireDraws{0};
+
+void glDrawElementsDetour(unsigned int mode, int count, unsigned int type, const void* indices) {
+    if (g_glDrawElementsOrig)
+        g_glDrawElementsOrig(mode, count, type, indices);
+
+    if (!g_enabled.load(std::memory_order_relaxed) || !g_boxEsp.load(std::memory_order_relaxed))
+        return;
+    if (!g_entityRenderArmed.load(std::memory_order_acquire))
+        return;
+    // GL_TRIANGLES
+    if (mode != 0x0004u) return;
+    if (count < 6 || count > 200000) return;
+    if (!g_glDrawElementsOrig) return;
+
+    const float width = std::max(0.5f, std::min(12.f, g_outlineWidth.load(std::memory_order_relaxed)));
+    const float glow = std::max(0.f, std::min(1.f, g_outlineGlow.load(std::memory_order_relaxed)));
+    const float alpha = std::max(0.1f, std::min(1.f, g_outlineAlpha.load(std::memory_order_relaxed)));
+
+    if (d_glEnable) d_glEnable(0x0BE2); // GL_BLEND
+    if (d_glBlendFunc) d_glBlendFunc(0x0302, 0x0303);
+    if (d_glDepthMask) d_glDepthMask(0);
+
+    // Glow passes: thicker, softer lines first (behind core edge)
+    if (glow > 0.05f && d_glLineWidth) {
+        const int passes = 1 + static_cast<int>(glow * 3.f); // 1..4
+        for (int p = passes; p >= 1; --p) {
+            const float w = width * (1.f + 0.55f * static_cast<float>(p));
+            d_glLineWidth(w);
+            // still same draw — GLES has no per-line color without shader; width creates glow halo
+            g_glDrawElementsOrig(0x0001u /*GL_LINES*/, count, type, indices);
+        }
+    }
+
+    // Core outline
+    if (d_glLineWidth) d_glLineWidth(width);
+    g_glDrawElementsOrig(0x0001u /*GL_LINES*/, count, type, indices);
+
+    if (d_glDepthMask) d_glDepthMask(1);
+    g_wireDraws.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool installDrawElementsHook() {
+    if (g_drawElementsHooked) return true;
+    void* p = glProc("glDrawElements");
+    if (!p) {
+        void* egl = dlopen("libEGL.so", RTLD_NOW);
+        if (egl) {
+            using EglGPA = void* (*)(const char*);
+            auto gpa = reinterpret_cast<EglGPA>(dlsym(egl, "eglGetProcAddress"));
+            if (gpa) p = gpa("glDrawElements");
+        }
+    }
+    if (!p) {
+        logLine("EntityOutline: glDrawElements not found");
+        return false;
+    }
+    void* o = nullptr;
+    // pl::memory::hook returns 0 on success (same as matrix hook)
+    if (pl::memory::hook(p, reinterpret_cast<void*>(&glDrawElementsDetour), &o) != 0 || !o) {
+        logLine("EntityOutline: glDrawElements HOOK FAIL");
+        return false;
+    }
+    g_glDrawElementsOrig = reinterpret_cast<PFN_glDrawElements>(o);
+    d_glDepthMask = reinterpret_cast<PFN_glDepthMask>(glProc("glDepthMask"));
+    loadLineGl();
+    g_drawElementsHooked = true;
+    logLine("EntityOutline: glDrawElements HOOKED width=%.1f glow=%.2f",
+            g_outlineWidth.load(), g_outlineGlow.load());
+    return true;
+}
+
+// Sync width/glow into Electrocharge Entity Outline pack config (if installed)
+void writeEntityOutlineConfig() {
+    const char* paths[] = {
+        "/sdcard/games/EntityOutline/config.json",
+        "/storage/emulated/0/games/EntityOutline/config.json",
+        nullptr,
+    };
+    const float w = g_outlineWidth.load(std::memory_order_relaxed);
+    const float g = g_outlineGlow.load(std::memory_order_relaxed);
+    const float a = g_outlineAlpha.load(std::memory_order_relaxed);
+    char body[512];
+    // Keys from libEntityOutline.so: width, strength, thick, alpha, outlineColor, masterEnabled
+    std::snprintf(body, sizeof(body),
+        "{\n"
+        "  \"masterEnabled\": true,\n"
+        "  \"enabled\": true,\n"
+        "  \"width\": %.2f,\n"
+        "  \"thick\": %.2f,\n"
+        "  \"strength\": %.2f,\n"
+        "  \"alpha\": %.2f,\n"
+        "  \"outlineColor\": [%.2f, %.2f, %.2f, %.2f]\n"
+        "}\n",
+        w, w, g, a,
+        g_r.load(std::memory_order_relaxed), g_g.load(std::memory_order_relaxed),
+        g_b.load(std::memory_order_relaxed), a);
+    for (int i = 0; paths[i]; ++i) {
+        FILE* f = std::fopen(paths[i], "w");
+        if (!f) continue;
+        std::fputs(body, f);
+        std::fclose(f);
+        logLine("EntityOutline: wrote config %s (width=%.1f glow=%.2f)", paths[i], w, g);
+        return;
+    }
+}
+
 void drawBoxEsp() {
     if (!g_boxEsp.load(std::memory_order_relaxed)) return;
     if (!g_vpValid.load(std::memory_order_acquire)) return;
@@ -374,7 +429,7 @@ void drawBoxEsp() {
     if (d_glDisable) d_glDisable(GL_DEPTH_TEST);
     if (d_glEnable) d_glEnable(GL_BLEND);
     if (d_glBlendFunc) d_glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    if (d_glLineWidth) d_glLineWidth(2.5f);
+    if (d_glLineWidth) d_glLineWidth(std::max(0.5f, std::min(12.f, g_outlineWidth.load(std::memory_order_relaxed))));
     d_glUseProgram(g_prog);
     if (d_glUniform4f && g_uColor >= 0) d_glUniform4f(g_uColor, 0.2f, 0.95f, 1.f, 0.95f); // Solstice-ish cyan
     d_glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
@@ -727,6 +782,15 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             }
         } else if (key == "playersOnly")
             g_playersOnly.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "outlineWidth")
+            g_outlineWidth.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        else if (key == "outlineGlow")
+            g_outlineGlow.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        else if (key == "outlineAlpha")
+            g_outlineAlpha.store(std::stof(std::string(value)), std::memory_order_relaxed);
+        if (key == "outlineWidth" || key == "outlineGlow" || key == "outlineAlpha" ||
+            key == "r" || key == "g" || key == "b")
+            writeEntityOutlineConfig();
         refresh();
     } catch (...) {
     }
