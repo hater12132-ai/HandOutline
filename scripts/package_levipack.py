@@ -12,15 +12,24 @@ def main() -> int:
     if not lib.is_file() or not icon.is_file():
         print("missing library or icon", file=sys.stderr)
         return 1
+    # Levi matches exact strings in minecraft_versions — list current known builds
     manifest = {
         "type": "preload-native",
         "name": "BactroNative",
         "author": "hater12132-ai",
-        "version": "1.15.0",
+        "version": "1.24.2",
         "entry": "libBactroNative.so",
         "icon": "icon.png",
-        "minecraft_versions": ["1.26.51.1"],
-        "description": "TargetHUD Attribute HP + damage + Perf + MotionBlur + HandChams + WireOutline.",
+        "minecraft_versions": [
+            "1.26.51.1",
+            "1.26.52",
+            "1.26.52.1",
+            "1.26.52.2",
+            "1.26.52.3",
+            "1.26.52.4",
+            "1.26.52.5",
+        ],
+        "description": "Snow Chams + Solstice box ESP + ChamsESP. Target 1.26.51–1.26.52.x",
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
