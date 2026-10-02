@@ -38,7 +38,7 @@ std::atomic_bool g_targetPlayers{true};
 std::atomic_bool g_targetMobs{true};   // non-player actors
 std::atomic_bool g_targetHand{true};   // FP hand / null actor (items, cosmetics-ish)
 std::atomic<int> g_fpSticky{0};
-std::atomic_bool g_boxEsp{false};
+std::atomic_bool g_boxEsp{true}; // Solstice box ESP default on
 std::atomic_bool g_playersOnly{true};
 std::atomic<float> g_r{1.00f};
 std::atomic<float> g_g{1.00f};
@@ -119,18 +119,19 @@ bool looksLikeWorldModel(const float* m, float& tx, float& ty, float& tz) {
     ty = m[13];
     tz = m[14];
     if (!std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(tz)) return false;
+    // Solstice-style: keep nearby players (old xz<16 rejected everything close)
     float xz = std::sqrt(tx * tx + tz * tz);
-    if (xz < 16.f) return false;
-    if (std::fabs(ty) < 0.5f && std::fabs(tz) < 0.5f) return false;
+    if (xz < 0.35f) return false;   // self / origin noise
+    if (xz > 128.f) return false;    // too far
     if (ty < -64.f || ty > 400.f) return false;
     if (std::fabs(tx) > 300000.f || std::fabs(tz) > 300000.f) return false;
     return true;
 }
 
 void noteWorldBox(float x, float y, float z) {
-    Box b{x - 0.4f, y - 0.1f, z - 0.4f, x + 0.4f, y + 1.8f, z + 0.4f};
+    Box b{x - 0.35f, y - 0.05f, z - 0.35f, x + 0.35f, y + 1.85f, z + 0.35f};
     std::lock_guard<std::mutex> lock(g_boxMu);
-    if (g_boxes.size() < 64) g_boxes.push_back(b);
+    if (g_boxes.size() < 96) g_boxes.push_back(b);
 }
 
 void glUniformMatrix4fvDetour(int location, int count, unsigned char transpose, const float* value) {
@@ -314,13 +315,18 @@ void drawBoxEsp() {
     if (d_glBlendFunc) d_glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     if (d_glLineWidth) d_glLineWidth(2.5f);
     d_glUseProgram(g_prog);
-    if (d_glUniform4f && g_uColor >= 0) d_glUniform4f(g_uColor, 1.f, 1.f, 1.f, 0.95f);
+    if (d_glUniform4f && g_uColor >= 0) d_glUniform4f(g_uColor, 0.2f, 0.95f, 1.f, 0.95f); // Solstice-ish cyan
     d_glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
     d_glBufferData(GL_ARRAY_BUFFER, (long)(lines.size() * sizeof(float)), lines.data(), 0x88E4);
     d_glEnableVertexAttribArray((GLuint)g_aPos);
     d_glVertexAttribPointer((GLuint)g_aPos, 2, GL_FLOAT, 0, 0, nullptr);
     d_glDrawArrays(GL_LINES, 0, (GLsizei)(lines.size() / 2));
     d_glUseProgram(0);
+    static int s_draw = 0;
+    if (s_draw < 8) {
+        logLine("SolsticeESP: drew %d segs from %d boxes", (int)(lines.size() / 2), (int)boxes.size());
+        ++s_draw;
+    }
 }
 
 // ---- FP hand only ----
@@ -406,13 +412,14 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
         ++s_ag;
     }
 
+    // Solstice ESP: arm model-matrix capture for this actor draw
     if (g_enabled.load(std::memory_order_relaxed) && g_boxEsp.load(std::memory_order_relaxed) && actor) {
         bool ok = true;
         if (g_playersOnly.load(std::memory_order_relaxed) && g_isPlayer) {
             try {
                 ok = g_isPlayer(actor);
             } catch (...) {
-                ok = false;
+                ok = true; // if check fails, still try capture
             }
         }
         if (ok) g_entityRenderArmed.store(true, std::memory_order_release);
@@ -625,7 +632,10 @@ void tryInstallHooks() {
 void onToggle(std::string_view, bool enabled) {
     g_enabled.store(enabled, std::memory_order_release);
     logLine("SnowChams %s", enabled ? "ON" : "OFF");
-    if (enabled) tryInstallHooks();
+    if (enabled) {
+        tryInstallHooks();
+        if (g_boxEsp.load(std::memory_order_relaxed)) installMatrixHook();
+    }
 }
 
 void onConfig(std::string_view, std::string_view key, std::string_view value) {
@@ -660,8 +670,7 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Snow Chams ESP");
-    b.description("Stable FP hand white fill + glint outline. No entity recolor (Hive-safe). "
-                  "Optional box ESP for players/mobs.")
+    b.description("Snow chams + Solstice-style screen box ESP (GLES lines).")
         .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
@@ -673,7 +682,7 @@ void registerModule() {
     b.config("targetMobs", "Mobs / other actors", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetHand", "Hand / items / cosmetics", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
 
-    b.config("boxEsp", "Box ESP", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("boxEsp", "Solstice Box ESP (screen boxes)", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("playersOnly", "ESP players only (off=players+mobs)", pl::modmenu::ConfigType::Toggle, "false", "",
              "", "");
     b.registerModule();
