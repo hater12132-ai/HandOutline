@@ -245,8 +245,6 @@ void registerMenus() {
     }
     bactro::motionblur::registerModule();
     bactro::handchams::registerModule();
-    bactro::chamsesp::registerModule();
-    bactro::entityoutline::registerModule();
 }
 
 } // namespace

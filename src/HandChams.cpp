@@ -9,6 +9,7 @@
 #include <EGL/egl.h>
 #include <android/log.h>
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cstdint>
@@ -38,7 +39,7 @@ std::atomic_bool g_targetPlayers{true};
 std::atomic_bool g_targetMobs{true};   // non-player actors
 std::atomic_bool g_targetHand{true};   // FP hand / null actor (items, cosmetics-ish)
 std::atomic<int> g_fpSticky{0};
-std::atomic_bool g_boxEsp{true}; // Solstice box ESP / entity wire outline
+std::atomic_bool g_boxEsp{false}; // REMOVED: screen boxes were drawn with depth test off (see-through). Never enabled.
 std::atomic<float> g_outlineWidth{2.5f};   // glLineWidth
 std::atomic<float> g_outlineGlow{0.6f};    // extra glow passes (0=off, 1=strong)
 std::atomic<float> g_outlineAlpha{0.95f};  // line alpha
@@ -445,6 +446,79 @@ void drawBoxEsp() {
     }
 }
 
+// ---- Thread probe (debug only) ------------------------------------------------------------------
+// Question it answers: is the actor-setup hook (main thread?) on the SAME thread as the GL draw calls?
+// If yes, "arm on setup, act on next draw" can identify entity draws. If not, it cannot, and a native
+// GL outline needs a different design. Output goes to bactro_status.txt (first 12 reports).
+std::atomic_bool g_probe{false};
+std::atomic<int> g_pSetupTid{0}, g_pDrawTid{0}, g_pSwapTid{0};
+std::atomic<int> g_pSetups{0}, g_pActorSetups{0}, g_pDraws{0}, g_pDrawsSame{0};
+std::atomic<int> g_pSince{0}, g_pMax{0}, g_pSum{0}, g_pN{0};
+std::atomic<int> g_pFrames{0}, g_pLines{0};
+PFN_glDrawElements g_probeDrawOrig = nullptr;
+bool g_probeDrawHooked = false;
+
+void probeNoteSetup(bool hasActor) {
+    g_pSetups.fetch_add(1, std::memory_order_relaxed);
+    if (!hasActor) return;
+    g_pActorSetups.fetch_add(1, std::memory_order_relaxed);
+    g_pSetupTid.store(static_cast<int>(gettid()), std::memory_order_relaxed);
+    const int between = g_pSince.exchange(0, std::memory_order_relaxed);
+    g_pSum.fetch_add(between, std::memory_order_relaxed);
+    g_pN.fetch_add(1, std::memory_order_relaxed);
+    int cur = g_pMax.load(std::memory_order_relaxed);
+    while (between > cur && !g_pMax.compare_exchange_weak(cur, between, std::memory_order_relaxed)) {
+    }
+}
+
+void probeDrawDetour(unsigned int mode, int count, unsigned int type, const void* indices) {
+    if (g_probe.load(std::memory_order_relaxed)) {
+        const int tid = static_cast<int>(gettid());
+        g_pDrawTid.store(tid, std::memory_order_relaxed);
+        g_pDraws.fetch_add(1, std::memory_order_relaxed);
+        if (tid == g_pSetupTid.load(std::memory_order_relaxed)) {
+            g_pDrawsSame.fetch_add(1, std::memory_order_relaxed);
+            g_pSince.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (g_probeDrawOrig) g_probeDrawOrig(mode, count, type, indices);
+}
+
+bool installProbeDrawHook() {
+    if (g_probeDrawHooked) return true;
+    void* p = glProc("glDrawElements");
+    if (!p) {
+        logLine("Probe: glDrawElements not found");
+        return false;
+    }
+    void* o = nullptr;
+    if (pl::memory::hook(p, reinterpret_cast<void*>(&probeDrawDetour), &o) != 0 || !o) {
+        logLine("Probe: glDrawElements HOOK FAIL");
+        return false;
+    }
+    g_probeDrawOrig = reinterpret_cast<PFN_glDrawElements>(o);
+    g_probeDrawHooked = true;
+    logLine("Probe: glDrawElements hooked (pass-through)");
+    return true;
+}
+
+void probeFrameTick() {
+    if (!g_probe.load(std::memory_order_relaxed)) return;
+    g_pSwapTid.store(static_cast<int>(gettid()), std::memory_order_relaxed);
+    if (g_pFrames.fetch_add(1, std::memory_order_relaxed) % 120 != 119) return;
+    if (g_pLines.load(std::memory_order_relaxed) >= 12) return;
+    const int idx = g_pLines.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int n = g_pN.exchange(0, std::memory_order_relaxed);
+    const int sum = g_pSum.exchange(0, std::memory_order_relaxed);
+    logLine("Probe#%d tid setup=%d draw=%d swap=%d", idx, g_pSetupTid.load(), g_pDrawTid.load(),
+            g_pSwapTid.load());
+    logLine("Probe#%d actorSetups=%d draws=%d drawsOnSetupThread=%d", idx,
+            g_pActorSetups.exchange(0), g_pDraws.exchange(0), g_pDrawsSame.exchange(0));
+    logLine("Probe#%d draws between actor setups: avg=%.1f max=%d", idx, n > 0 ? (float)sum / (float)n : 0.f,
+            g_pMax.exchange(0));
+    g_pSetups.store(0, std::memory_order_relaxed);
+}
+
 // ---- FP hand only ----
 using RenderFirstPersonFn = void (*)(void*, void*, void*, void*, void*, void*);
 RenderFirstPersonFn g_renderFpOriginal = nullptr;
@@ -528,6 +602,8 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
         ++s_ag;
     }
 
+    if (g_probe.load(std::memory_order_relaxed)) probeNoteSetup(actor != nullptr);
+
     // Solstice ESP: arm model-matrix capture for this actor draw
     if (actor) {
         // Shared arm for Entity Outline module (and optional box ESP)
@@ -555,23 +631,11 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
         bool doChams = false;
         const bool fxOn = false;
         if (actor == nullptr) {
-            // Hand / held item / cosmetics
+            // First-person hand / held item only.
             doChams = g_targetHand.load(std::memory_order_relaxed) || fxOn || handWin;
-        } else {
-            // World actors — players + mobs (chams on people)
-            bool isPl = false;
-            if (g_isPlayer) {
-                try {
-                    isPl = g_isPlayer(actor);
-                } catch (...) {
-                    isPl = false;
-                }
-            }
-            if (isPl)
-                doChams = g_targetPlayers.load(std::memory_order_relaxed);
-            else
-                doChams = g_targetMobs.load(std::memory_order_relaxed);
         }
+        // World actors (players/mobs) are intentionally NOT tinted here: this glint path is the one
+        // armor / enchanted gear is drawn through, which is what made chams show up on armor.
 
         if (doChams) {
             refresh();
@@ -775,13 +839,19 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             g_targetPlayers.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "targetMobs")
             g_targetMobs.store(value == "true" || value == "1", std::memory_order_relaxed);
+        else if (key == "probe") {
+            const bool on = (value == "true" || value == "1");
+            g_probe.store(on, std::memory_order_relaxed);
+            if (on) {
+                tryInstallHooks();
+                installProbeDrawHook();
+            }
+            logLine(on ? "Probe ON (join a world with players/mobs nearby, wait ~30s)" : "Probe OFF");
+        }
         else if (key == "targetHand")
             g_targetHand.store(value == "true" || value == "1", std::memory_order_relaxed);
                 else if (key == "boxEsp") {
-            g_boxEsp.store(value == "true" || value == "1", std::memory_order_relaxed);
-            if (g_boxEsp.load() && g_enabled.load()) {
-                installMatrixHook();
-            }
+            g_boxEsp.store(false, std::memory_order_relaxed); // ignored: see-through ESP removed
         } else if (key == "playersOnly")
             g_playersOnly.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "outlineWidth")
@@ -801,8 +871,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 } // namespace
 
 void registerModule() {
-    pl::modmenu::ModuleBuilder b(kModuleId, "Snow Chams ESP");
-    b.description("Snow chams + Solstice-style screen box ESP (GLES lines).")
+    pl::modmenu::ModuleBuilder b(kModuleId, "Hand Chams");
+    b.description("Tint on first-person hand / held item. No armor tint, no through-wall ESP.")
         .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
@@ -810,13 +880,9 @@ void registerModule() {
     b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.85", "0.05", "1.0", "");
-    b.config("targetPlayers", "Players", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
-    b.config("targetMobs", "Mobs / other actors", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetHand", "Hand / items / cosmetics", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("probe", "Thread probe (debug)", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
 
-    b.config("boxEsp", "Solstice Box ESP (screen boxes)", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
-    b.config("playersOnly", "ESP players only (off=players+mobs)", pl::modmenu::ConfigType::Toggle, "false", "",
-             "", "");
     b.registerModule();
 }
 
@@ -831,6 +897,7 @@ void onSignaturesReady() {
 void shutdown() { g_enabled.store(false, std::memory_order_release); }
 
 void onPostFrame() {
+    probeFrameTick();
     if (g_enabled.load(std::memory_order_relaxed)) drawBoxEsp();
     static int s_wlog = 0;
     const int wd = g_wireDraws.exchange(0, std::memory_order_relaxed);

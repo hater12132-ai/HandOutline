@@ -17,7 +17,7 @@ def main() -> int:
         "type": "preload-native",
         "name": "BactroNative",
         "author": "hater12132-ai",
-        "version": "1.27.0",
+        "version": "1.27.2",
         "entry": "libBactroNative.so",
         "icon": "icon.png",
         "minecraft_versions": [
@@ -29,7 +29,7 @@ def main() -> int:
             "1.26.52.4",
             "1.26.52.5",
         ],
-        "description": "Snow Chams + Solstice box ESP + ChamsESP. Target 1.26.51–1.26.52.x",
+        "description": "Hand chams (no through-wall ESP, no armor tint). Target 1.26.51–1.26.52.x",
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
