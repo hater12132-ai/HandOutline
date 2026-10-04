@@ -5,6 +5,8 @@
 #include "bactro/EntityOutline.hpp"
 #include "bactro/MaterialProbe.hpp"
 #include "bactro/Status.hpp"
+#include "bactro/Guard.hpp"
+#include "bactro/RenderPhase.hpp"
 #include "Version.hpp"
 
 #include <pl/Mod.hpp>
@@ -263,6 +265,10 @@ public:
     bool load(pl::mod::ModContext&) {
         writeStatusReplace(std::string("load ") + std::string(bactro::Name) + " " +
                            std::string(bactro::Version) + "\n");
+        if (bactro::guard::beginSession()) {
+            bactro::phase::safeMode.store(true, std::memory_order_release);
+            writeStatus("SAFE MODE: last session crashed right after hooks started. Actor hooks are skipped this launch; relaunch to retry.");
+        }
         return true;
     }
 

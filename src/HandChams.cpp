@@ -1,5 +1,6 @@
 #include "bactro/HandChams.hpp"
 #include "bactro/RenderPhase.hpp"
+#include "bactro/Guard.hpp"
 #include "bactro/Signatures.hpp"
 #include "bactro/Status.hpp"
 
@@ -37,6 +38,7 @@ std::atomic_bool g_enabled{false};
 std::atomic_bool g_handOnly{false}; // false = allow world actors when targets enabled
 std::atomic_bool g_targetPlayers{true};
 std::atomic_bool g_targetMobs{true};   // non-player actors
+std::atomic_bool g_targetActors{true}; // every actor: players, mobs, menu dummy
 std::atomic_bool g_targetHand{true};   // FP hand / null actor (items, cosmetics-ish)
 std::atomic<int> g_fpSticky{0};
 std::atomic_bool g_boxEsp{false}; // REMOVED: screen boxes were drawn with depth test off (see-through). Never enabled.
@@ -519,15 +521,28 @@ void probeFrameTick() {
     g_pSetups.store(0, std::memory_order_relaxed);
 }
 
-// ---- FP hand only ----
-using RenderFirstPersonFn = void (*)(void*, void*, void*, void*, void*, void*);
-RenderFirstPersonFn g_renderFpOriginal = nullptr;
+// ---- Generic ARM64 pass-through ------------------------------------------------------------------
+// The exact arity of these game functions differs between builds. A fixed-arity detour silently drops
+// stack arguments, which makes the original read garbage and crash. This signature forwards all 8
+// integer registers, all 8 FP registers and 8 stack slots unchanged, so any arity up to that works.
+using U64 = std::uint64_t;
+using GenericFn = void (*)(void*, void*, void*, void*, void*, void*, void*, void*, double, double, double, double,
+                           double, double, double, double, U64, U64, U64, U64, U64, U64, U64, U64);
+#define GEN_DECL                                                                                           \
+    void *x0, void *x1, void *x2, void *x3, void *x4, void *x5, void *x6, void *x7, double d0, double d1, \
+        double d2, double d3, double d4, double d5, double d6, double d7, U64 t0, U64 t1, U64 t2, U64 t3,  \
+        U64 t4, U64 t5, U64 t6, U64 t7
+#define GEN_TAIL d0, d1, d2, d3, d4, d5, d6, d7, t0, t1, t2, t3, t4, t5, t6, t7
+#define GEN_FWD(fn) fn(x0, x1, x2, x3, x4, x5, x6, x7, GEN_TAIL)
 
-void renderFirstPersonDetour(void* self, void* a1, void* a2, void* a3, void* a4, void* a5) {
+// ---- FP hand only ----
+GenericFn g_renderFpOriginal = nullptr;
+
+void renderFirstPersonDetour(GEN_DECL) {
     if (!g_renderFpOriginal) return;
     bactro::phase::inFirstPersonHand.store(true, std::memory_order_release);
-    g_fpSticky.store(32, std::memory_order_release); // longer window for constants + glint + edge
-    g_renderFpOriginal(self, a1, a2, a3, a4, a5);
+    g_fpSticky.store(32, std::memory_order_release);
+    GEN_FWD(g_renderFpOriginal);
 }
 
 using SetEntityConstantsFn = void (*)(void*, void*, const Color*, const void*, const void*, const Color*,
@@ -584,16 +599,14 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
                          &s_fill, &s_edge, glintUVScale, uvAnim, uvOffset1, uvOffset2, uvRot1, uvRot2);
 }
 
-using SetupActorGlintFn = void (*)(void*, void*, void*, const Color*, const Color*, const Color*, const Color*,
-                                   float, float, float, float, const void*);
-SetupActorGlintFn g_setupActorGlint = nullptr;
-SetupActorGlintFn g_setupGlint = nullptr;
+GenericFn g_setupActorGlint = nullptr;
+GenericFn g_setupGlint = nullptr;
 
-void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor, const Color* overlay,
-                           const Color* changeColor, const Color* changeColor2, const Color* glintColor,
-                           float uvOffset1, float uvOffset2, float uvRot1, float uvRot2,
-                           const void* lightEmissionColor) {
+// Registers: x0 screenContext, x1 entityContext, x2 actor, x3 overlay, x4 changeColor, x5 changeColor2,
+// x6 glintColor. Everything else is forwarded untouched. No call into the actor object is made.
+void setupActorGlintDetour(GEN_DECL) {
     if (!g_setupActorGlint) return;
+    void* actor = x2;
 
     static int s_ag = 0;
     if (s_ag < 6) {
@@ -601,171 +614,102 @@ void setupActorGlintDetour(void* screenContext, void* entityContext, void* actor
                 g_enabled.load(std::memory_order_relaxed) ? 1 : 0, actor);
         ++s_ag;
     }
-
+    bactro::guard::noteRiskyHookRan();
     if (g_probe.load(std::memory_order_relaxed)) probeNoteSetup(actor != nullptr);
 
-    // Solstice ESP: arm model-matrix capture for this actor draw
-    if (actor) {
-        // Shared arm for Entity Outline module (and optional box ESP)
-        bool ok = true;
-        if (g_playersOnly.load(std::memory_order_relaxed) && g_isPlayer) {
-            try {
-                ok = g_isPlayer(actor);
-            } catch (...) {
-                ok = true;
-            }
-        }
-        if (ok) {
-            bactro::phase::entityMeshArmed.store(true, std::memory_order_release);
-            if (g_enabled.load(std::memory_order_relaxed) && g_boxEsp.load(std::memory_order_relaxed))
-                g_entityRenderArmed.store(true, std::memory_order_release);
-        }
-    }
-
-    // Snow chams: static Color only. Filter by Players / Mobs / Hand.
     if (g_enabled.load(std::memory_order_relaxed)) {
-        const bool fp = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire);
-        const int sticky = g_fpSticky.load(std::memory_order_acquire);
-        const bool handWin = fp || sticky > 0;
-
-        bool doChams = false;
-        const bool fxOn = false;
-        if (actor == nullptr) {
-            // First-person hand / held item only.
-            doChams = g_targetHand.load(std::memory_order_relaxed) || fxOn || handWin;
-        }
-        // World actors (players/mobs) are intentionally NOT tinted here: this glint path is the one
-        // armor / enchanted gear is drawn through, which is what made chams show up on armor.
-
+        const bool handWin = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire) ||
+                             g_fpSticky.load(std::memory_order_acquire) > 0;
+        // actor == nullptr: first-person hand / held item. actor != nullptr: ANY actor
+        // (players, mobs, and the dummy in the menu / inventory screen).
+        const bool doChams = actor ? g_targetActors.load(std::memory_order_relaxed)
+                                   : g_targetHand.load(std::memory_order_relaxed);
         if (doChams) {
             refresh();
             static Color s_fill{};
             static Color s_edge{};
             s_fill = g_chams;
-            // Normal-hook hand outline attempt: bright white glint edge
-            // (same family as item_in_hand_glint material path)
-            if (handWin || actor == nullptr) {
+            if (handWin || !actor) {
                 s_edge = {1.f, 1.f, 1.f, 1.f};
                 if (s_fill.a < 0.75f) s_fill.a = 0.75f;
             } else {
                 s_edge = g_outline;
                 s_edge.a = 1.f;
             }
-
             static int s_gapp = 0;
             if (s_gapp < 12) {
-                logLine("HandChams: GLINT APPLY #%d fp=%d actor=%p edge=white", s_gapp, fp ? 1 : 0, actor);
+                logLine("HandChams: GLINT APPLY #%d actor=%p", s_gapp, actor);
                 ++s_gapp;
             }
-            g_setupActorGlint(screenContext, entityContext, actor, &s_fill, &s_fill, &s_fill, &s_edge, uvOffset1,
-                              uvOffset2, uvRot1, uvRot2, lightEmissionColor);
+            g_setupActorGlint(x0, x1, x2, &s_fill, &s_fill, &s_fill, &s_edge, x7, GEN_TAIL);
             return;
         }
     }
-
-    g_setupActorGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor,
-                      uvOffset1, uvOffset2, uvRot1, uvRot2, lightEmissionColor);
+    GEN_FWD(g_setupActorGlint);
 }
 
-void setupGlintDetour(void* screenContext, void* entityContext, void* actor, const Color* overlay,
-                      const Color* changeColor, const Color* changeColor2, const Color* glintColor, float uvOffset1,
-                      float uvOffset2, float uvRot1, float uvRot2, const void* lightEmissionColor) {
+void setupGlintDetour(GEN_DECL) {
     if (!g_setupGlint) return;
-    const bool en = g_enabled.load(std::memory_order_relaxed);
     const bool handWin = bactro::phase::inFirstPersonHand.load(std::memory_order_acquire) ||
                          g_fpSticky.load(std::memory_order_acquire) > 0;
-    if (en && g_targetHand.load(std::memory_order_relaxed) && (handWin || actor == nullptr)) {
+    if (g_enabled.load(std::memory_order_relaxed) && g_targetHand.load(std::memory_order_relaxed) &&
+        (handWin || x2 == nullptr)) {
         refresh();
         static Color fill{}, edge{};
         fill = g_chams;
         if (fill.a < 0.85f) fill.a = 0.85f;
         edge = {1.f, 1.f, 1.f, 1.f};
-        static int n = 0;
-        if (n < 10) {
-            logLine("HandChams: SETUP_GLINT APPLY #%d (hand outline attempt)", n);
-            ++n;
-        }
-        g_setupGlint(screenContext, entityContext, actor, &fill, &fill, &fill, &edge, uvOffset1, uvOffset2, uvRot1,
-                     uvRot2, lightEmissionColor);
+        g_setupGlint(x0, x1, x2, &fill, &fill, &fill, &edge, x7, GEN_TAIL);
         return;
     }
-    g_setupGlint(screenContext, entityContext, actor, overlay, changeColor, changeColor2, glintColor, uvOffset1,
-                 uvOffset2, uvRot1, uvRot2, lightEmissionColor);
+    GEN_FWD(g_setupGlint);
 }
 
-using SetupFoilFn = void (*)(void*, void*, void*, void*, void*, void*, void*, void*);
-SetupFoilFn g_setupFoil = nullptr;
-bool g_hookedFoil = false;
-
-void setupFoilDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7) {
-    if (!g_setupFoil) return;
-    static int s_f = 0;
-    if (s_f < 5) {
-        logLine("HandChams: SetupFoil ENTER #%d en=%d", s_f, g_enabled.load() ? 1 : 0);
-        ++s_f;
-    }
-    // Always call through — foil is enchanted-item path; still useful signal
-    g_setupFoil(a0, a1, a2, a3, a4, a5, a6, a7);
-}
-
-
-
-// ItemInHandShaderSetup — arm FP window (6-arg safe pass-through, matches renderFirstPerson style)
-using ItemInHandSetupFn = void (*)(void*, void*, void*, void*, void*, void*);
-ItemInHandSetupFn g_itemHandSetup = nullptr;
+// ItemInHandShaderSetup — arms the first-person window.
+GenericFn g_itemHandSetup = nullptr;
 bool g_itemHandHooked = false;
 
-void itemInHandSetupDetour(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5) {
+void itemInHandSetupDetour(GEN_DECL) {
     if (!g_itemHandSetup) return;
     if (g_enabled.load(std::memory_order_relaxed) && g_targetHand.load(std::memory_order_relaxed)) {
         bactro::phase::inFirstPersonHand.store(true, std::memory_order_release);
         g_fpSticky.store(32, std::memory_order_release);
-        static int n = 0;
-        if (n < 8) {
-            logLine("HandChams: ItemInHandShaderSetup #%d FP armed", n);
-            ++n;
-        }
     }
-    g_itemHandSetup(a0, a1, a2, a3, a4, a5);
+    GEN_FWD(g_itemHandSetup);
 }
 
 void tryInstallHooks() {
-    void* o = nullptr;
-
-    if (!g_isPlayer) {
-        std::uintptr_t addr = bactro::memory::resolve(bactro::memory::SignatureId::ActorIsPlayer);
-        if (addr) {
-            g_isPlayer = reinterpret_cast<ActorIsPlayerFn>(addr);
-            logLine("SnowChams: ActorIsPlayer @%p", reinterpret_cast<void*>(addr));
+    if (bactro::phase::safeMode.load(std::memory_order_acquire)) {
+        static bool s_logged = false;
+        if (!s_logged) {
+            s_logged = true;
+            logLine("HandChams: SAFE MODE - hooks skipped (previous session crashed early). Relaunch to retry.");
         }
+        return;
     }
-
-    // Matrix hook only if box ESP wanted (avoids extra work / crash surface on launch)
-    if (g_boxEsp.load(std::memory_order_relaxed)) installMatrixHook();
+    void* o = nullptr;
 
     if (!g_renderFpHooked) {
         o = nullptr;
         if (bactro::memory::hook(bactro::memory::SignatureId::ItemInHandRendererRenderFirstPerson,
                                  reinterpret_cast<void*>(&renderFirstPersonDetour), &o) &&
             o) {
-            g_renderFpOriginal = reinterpret_cast<RenderFirstPersonFn>(o);
+            g_renderFpOriginal = reinterpret_cast<GenericFn>(o);
             g_renderFpHooked = true;
             logLine("HandChams: renderFirstPerson hooked");
         } else
             logLine("HandChams: renderFirstPerson FAIL");
-
+    }
     if (!g_itemHandHooked) {
-        void* o = nullptr;
+        o = nullptr;
         if (bactro::memory::hook(bactro::memory::SignatureId::ItemInHandShaderSetup,
                                  reinterpret_cast<void*>(&itemInHandSetupDetour), &o) &&
             o) {
-            g_itemHandSetup = reinterpret_cast<ItemInHandSetupFn>(o);
+            g_itemHandSetup = reinterpret_cast<GenericFn>(o);
             g_itemHandHooked = true;
             logLine("HandChams: ItemInHandShaderSetup hooked");
         } else
             logLine("HandChams: ItemInHandShaderSetup FAIL");
-    }
-
     }
     if (!g_hookedEntity) {
         o = nullptr;
@@ -783,7 +727,7 @@ void tryInstallHooks() {
         if (bactro::memory::hook(bactro::memory::SignatureId::ActorShaderManagerSetupShaderParametersActorGlint,
                                  reinterpret_cast<void*>(&setupActorGlintDetour), &o) &&
             o) {
-            g_setupActorGlint = reinterpret_cast<SetupActorGlintFn>(o);
+            g_setupActorGlint = reinterpret_cast<GenericFn>(o);
             g_hookedActor = true;
             logLine("HandChams: setupActorGlint hooked");
         } else
@@ -794,24 +738,14 @@ void tryInstallHooks() {
         if (bactro::memory::hook(bactro::memory::SignatureId::ActorShaderManagerSetupShaderParametersGlint,
                                  reinterpret_cast<void*>(&setupGlintDetour), &o) &&
             o) {
-            g_setupGlint = reinterpret_cast<SetupActorGlintFn>(o);
+            g_setupGlint = reinterpret_cast<GenericFn>(o);
             g_hookedGlint = true;
             logLine("HandChams: setupGlint hooked");
         } else
             logLine("HandChams: setupGlint FAIL");
     }
-    if (!g_hookedFoil) {
-        o = nullptr;
-        if (bactro::memory::hook(bactro::memory::SignatureId::ActorShaderManagerSetupFoilShaderParameters,
-                                 reinterpret_cast<void*>(&setupFoilDetour), &o) &&
-            o) {
-            g_setupFoil = reinterpret_cast<SetupFoilFn>(o);
-            g_hookedFoil = true;
-            logLine("HandChams: setupFoil hooked");
-        } else
-            logLine("HandChams: setupFoil FAIL");
-    }
-    logLine("SnowChams: hooks fp=%d entity=%d actor=%d glint=%d foil=%d itemHand=%d matrix=%d", g_renderFpHooked ? 1 : 0, g_hookedEntity ? 1 : 0, g_hookedActor ? 1 : 0, g_hookedGlint ? 1 : 0, g_hookedFoil ? 1 : 0, g_itemHandHooked ? 1 : 0, g_glUniformHooked ? 1 : 0);
+    logLine("HandChams: hooks fp=%d entity=%d actor=%d glint=%d itemHand=%d", g_renderFpHooked ? 1 : 0,
+            g_hookedEntity ? 1 : 0, g_hookedActor ? 1 : 0, g_hookedGlint ? 1 : 0, g_itemHandHooked ? 1 : 0);
 }
 
 void onToggle(std::string_view, bool enabled) {
@@ -848,6 +782,8 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             }
             logLine(on ? "Probe ON (join a world with players/mobs nearby, wait ~30s)" : "Probe OFF");
         }
+        else if (key == "targetActors")
+            g_targetActors.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "targetHand")
             g_targetHand.store(value == "true" || value == "1", std::memory_order_relaxed);
                 else if (key == "boxEsp") {
@@ -872,7 +808,7 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
 
 void registerModule() {
     pl::modmenu::ModuleBuilder b(kModuleId, "Hand Chams");
-    b.description("Tint on first-person hand / held item. No armor tint, no through-wall ESP.")
+    b.description("Chams tint on actors (players, mobs, menu dummy) and first-person hand. Depth-tested: no through-wall ESP.")
         .defaultEnabled(false)
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
@@ -880,6 +816,7 @@ void registerModule() {
     b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
     b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.85", "0.05", "1.0", "");
+    b.config("targetActors", "All actors (players, mobs, menu dummy)", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetHand", "Hand / items / cosmetics", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("probe", "Thread probe (debug)", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
 
@@ -898,6 +835,7 @@ void shutdown() { g_enabled.store(false, std::memory_order_release); }
 
 void onPostFrame() {
     probeFrameTick();
+    bactro::guard::frameTick();
     if (g_enabled.load(std::memory_order_relaxed)) drawBoxEsp();
     static int s_wlog = 0;
     const int wd = g_wireDraws.exchange(0, std::memory_order_relaxed);
