@@ -1,7 +1,9 @@
 #pragma once
 namespace bactro::material {
 void onSignaturesReady();
-// Debug probes (logging only, default off). Output goes to bactro_status.txt.
-void setAssetProbe(bool on);  // hooks AAssetManager_open (public NDK API) and logs *.material.bin requests
-void setPathProbe(bool on);   // hooks MaterialBinPathBuilder (x8/sret-safe) and logs what it is asked for
+// Debug / native material tools (default off). Output goes to bactro_status.txt.
+void setAssetProbe(bool on);       // log material file opens (AAssetManager_open)
+void setMaterialDump(bool on);     // save original Actor/Entity/ItemInHand material.bin to bactro_materials/dump
+void setMaterialOverride(bool on); // serve bactro_materials/override/<Name>.material.bin instead of the APK file
+void setPathProbe(bool on);        // MaterialBinPathBuilder logger (never fired in testing; kept for reference)
 } // namespace bactro::material

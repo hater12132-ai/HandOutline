@@ -9,7 +9,14 @@
 #include "bactro/RenderPhase.hpp"
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <set>
+#include <string>
+#include <sys/stat.h>
+#include <unordered_map>
+#include <vector>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -82,24 +89,274 @@ bool describeArg(const void* arg, char* out, size_t cap) {
     return false;
 }
 
-// ---- 1) AAssetManager_open logger (public NDK ABI: AAsset* f(AAssetManager*, const char*, int)) ----
+// ---- 1) Native asset interception (public NDK ABI, no resource pack, no extra loader mod) ----
+// Findings from your log: the game loads "assets/renderer/materials/<Name>.material.bin" through
+// AAssetManager_open(mode=3 / buffer). Mobs and players use Actor.material.bin.
+//   * Asset probe   : log material opens.
+//   * Material dump : save the ORIGINAL Actor/Entity/ItemInHand material.bin to <root>/dump/ (so it can be analysed).
+//   * Override      : if <root>/override/<Name>.material.bin exists, serve that file instead of the APK's.
+constexpr const char* kRoot = "/storage/emulated/0/Android/media/org.levimc.launcher/bactro_materials";
+
 std::atomic_bool g_assetOn{false};
+std::atomic_bool g_dumpOn{false};
+std::atomic_bool g_ovOn{false};
 bool g_assetHooked = false;
-void* (*g_assetOrig)(void*, const char*, int) = nullptr;
+bool g_ovHooked = false;
+using OpenFn = void* (*)(void*, const char*, int);
+OpenFn g_assetOrig = nullptr;
 std::atomic<int> g_assetLines{0};
 
-void* assetOpenDetour(void* mgr, const char* name, int mode) {
-    if (g_assetOn.load(std::memory_order_relaxed) && name) {
-        char buf[200];
-        if (safeRead(name, buf, 120)) {
-            buf[119] = 0;
-            if (std::strstr(buf, "material") || std::strstr(buf, "renderer")) {
-                const int n = g_assetLines.fetch_add(1, std::memory_order_relaxed);
-                if (n < 250) logLine("AssetProbe: open \"%.150s\" mode=%d", buf, mode);
-            }
-        }
+// Real libandroid entry points (resolved with dlsym; calling them is always safe).
+int64_t (*f_getLength64)(void*) = nullptr;
+const void* (*f_getBuffer)(void*) = nullptr;
+
+// Originals returned by the hook engine (override hooks only).
+int64_t (*o_getLength)(void*) = nullptr;
+int64_t (*o_getLength64)(void*) = nullptr;
+int64_t (*o_getRemaining)(void*) = nullptr;
+int64_t (*o_getRemaining64)(void*) = nullptr;
+const void* (*o_getBuffer)(void*) = nullptr;
+int (*o_read)(void*, void*, size_t) = nullptr;
+int64_t (*o_seek)(void*, int64_t, int) = nullptr;
+int64_t (*o_seek64)(void*, int64_t, int) = nullptr;
+void (*o_close)(void*) = nullptr;
+int (*o_isAllocated)(void*) = nullptr;
+int (*o_openFd)(void*, int64_t*, int64_t*) = nullptr;
+int (*o_openFd64)(void*, int64_t*, int64_t*) = nullptr;
+
+struct Ov {
+    std::vector<unsigned char> data;
+    int64_t pos = 0;
+};
+std::mutex g_ovMu;
+std::unordered_map<void*, Ov> g_ov;
+std::atomic<int> g_ovCount{0};
+
+#define OV_FIND(a)                                      \
+    if (g_ovCount.load(std::memory_order_relaxed) > 0) { \
+        std::lock_guard<std::mutex> lk(g_ovMu);          \
+        auto it = g_ov.find(a);                          \
+        if (it != g_ov.end()) {
+#define OV_END \
+        }      \
     }
-    return g_assetOrig ? g_assetOrig(mgr, name, mode) : nullptr;
+
+int64_t dGetLength(void* a) {
+    OV_FIND(a) return static_cast<int64_t>(it->second.data.size());
+    OV_END
+    return o_getLength(a);
+}
+int64_t dGetLength64(void* a) {
+    OV_FIND(a) return static_cast<int64_t>(it->second.data.size());
+    OV_END
+    return o_getLength64(a);
+}
+int64_t dGetRemaining(void* a) {
+    OV_FIND(a) return static_cast<int64_t>(it->second.data.size()) - it->second.pos;
+    OV_END
+    return o_getRemaining(a);
+}
+int64_t dGetRemaining64(void* a) {
+    OV_FIND(a) return static_cast<int64_t>(it->second.data.size()) - it->second.pos;
+    OV_END
+    return o_getRemaining64(a);
+}
+const void* dGetBuffer(void* a) {
+    OV_FIND(a) return it->second.data.data();
+    OV_END
+    return o_getBuffer(a);
+}
+int dRead(void* a, void* dst, size_t n) {
+    OV_FIND(a) {
+        const int64_t size = static_cast<int64_t>(it->second.data.size());
+        int64_t left = size - it->second.pos;
+        if (left < 0) left = 0;
+        const size_t take = static_cast<size_t>(left) < n ? static_cast<size_t>(left) : n;
+        if (take) std::memcpy(dst, it->second.data.data() + it->second.pos, take);
+        it->second.pos += static_cast<int64_t>(take);
+        return static_cast<int>(take);
+    }
+    OV_END
+    return o_read(a, dst, n);
+}
+int64_t seekImpl(Ov& o, int64_t off, int whence) {
+    const int64_t size = static_cast<int64_t>(o.data.size());
+    int64_t np = 0;
+    if (whence == SEEK_SET) np = off;
+    else if (whence == SEEK_CUR) np = o.pos + off;
+    else if (whence == SEEK_END) np = size + off;
+    else return -1;
+    if (np < 0 || np > size) return -1;
+    o.pos = np;
+    return np;
+}
+int64_t dSeek(void* a, int64_t off, int whence) {
+    OV_FIND(a) return seekImpl(it->second, off, whence);
+    OV_END
+    return o_seek(a, off, whence);
+}
+int64_t dSeek64(void* a, int64_t off, int whence) {
+    OV_FIND(a) return seekImpl(it->second, off, whence);
+    OV_END
+    return o_seek64(a, off, whence);
+}
+void dClose(void* a) {
+    if (g_ovCount.load(std::memory_order_relaxed) > 0) {
+        std::lock_guard<std::mutex> lk(g_ovMu);
+        if (g_ov.erase(a)) g_ovCount.fetch_sub(1, std::memory_order_relaxed);
+    }
+    o_close(a);
+}
+int dIsAllocated(void* a) {
+    OV_FIND(a) return 1;
+    OV_END
+    return o_isAllocated(a);
+}
+int dOpenFd(void* a, int64_t* st, int64_t* ln) {
+    OV_FIND(a) return -1;
+    OV_END
+    return o_openFd(a, st, ln);
+}
+int dOpenFd64(void* a, int64_t* st, int64_t* ln) {
+    OV_FIND(a) return -1;
+    OV_END
+    return o_openFd64(a, st, ln);
+}
+#undef OV_FIND
+#undef OV_END
+
+// Some libandroid exports (e.g. AAsset_getLength / AAsset_getLength64) can be folded onto one address.
+// Hooking the same address twice is not safe, so the second symbol just reuses the first original; the
+// paired detours behave identically for tracked assets, so the first detour covers both.
+bool hookSym(void* lib, const char* sym, void* detour, void** orig) {
+    static std::unordered_map<void*, void*> s_done;
+    void* fn = dlsym(lib, sym);
+    if (!fn) return false;
+    auto it = s_done.find(fn);
+    if (it != s_done.end()) {
+        *orig = it->second;
+        return *orig != nullptr;
+    }
+    if (pl::memory::hook(fn, detour, orig) != 0 || !*orig) return false;
+    s_done[fn] = *orig;
+    return true;
+}
+
+bool installOverrideHooks() {
+    if (g_ovHooked) return true;
+    void* lib = dlopen("libandroid.so", RTLD_NOW);
+    if (!lib) { logLine("MatOverride: libandroid.so not found"); return false; }
+    bool ok = true;
+#define HK(sym, det, orig) ok = hookSym(lib, sym, reinterpret_cast<void*>(&det), reinterpret_cast<void**>(&orig)) && ok
+    HK("AAsset_getLength", dGetLength, o_getLength);
+    HK("AAsset_getLength64", dGetLength64, o_getLength64);
+    HK("AAsset_getRemainingLength", dGetRemaining, o_getRemaining);
+    HK("AAsset_getRemainingLength64", dGetRemaining64, o_getRemaining64);
+    HK("AAsset_getBuffer", dGetBuffer, o_getBuffer);
+    HK("AAsset_read", dRead, o_read);
+    HK("AAsset_seek", dSeek, o_seek);
+    HK("AAsset_seek64", dSeek64, o_seek64);
+    HK("AAsset_close", dClose, o_close);
+    HK("AAsset_isAllocated", dIsAllocated, o_isAllocated);
+    HK("AAsset_openFileDescriptor", dOpenFd, o_openFd);
+    HK("AAsset_openFileDescriptor64", dOpenFd64, o_openFd64);
+#undef HK
+    if (!ok) {
+        logLine("MatOverride: some AAsset_* hooks failed - override disabled");
+        return false;
+    }
+    g_ovHooked = true;
+    logLine("MatOverride: AAsset_* hooks installed");
+    return true;
+}
+
+void ensureDirs() {
+    mkdir(kRoot, 0777);
+    mkdir((std::string(kRoot) + "/dump").c_str(), 0777);
+    mkdir((std::string(kRoot) + "/override").c_str(), 0777);
+}
+
+bool wantDump(const std::string& f) {
+    return f.find("Actor") != std::string::npos || f.find("Entity") != std::string::npos ||
+           f.find("ItemInHand") != std::string::npos;
+}
+
+void maybeDump(void* asset, const std::string& fname) {
+    static std::mutex m;
+    static std::set<std::string> done;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        if (!done.insert(fname).second) return;
+    }
+    if (!f_getLength64 || !f_getBuffer) return;
+    const int64_t len = f_getLength64(asset);
+    const void* buf = f_getBuffer(asset);
+    if (len <= 0 || !buf) {
+        logLine("MatDump: %.60s unreadable (len=%lld)", fname.c_str(), static_cast<long long>(len));
+        return;
+    }
+    ensureDirs();
+    const std::string path = std::string(kRoot) + "/dump/" + fname;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) { logLine("MatDump: cannot write %.80s", path.c_str()); return; }
+    const size_t w = std::fwrite(buf, 1, static_cast<size_t>(len), f);
+    std::fclose(f);
+    logLine("MatDump: saved %.60s (%lld bytes, wrote %lld)", fname.c_str(), static_cast<long long>(len),
+            static_cast<long long>(w));
+}
+
+void maybeOverride(void* asset, const std::string& fname) {
+    const std::string path = std::string(kRoot) + "/override/" + fname;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return;
+    std::vector<unsigned char> data;
+    unsigned char tmp[16384];
+    size_t n;
+    while ((n = std::fread(tmp, 1, sizeof(tmp), f)) > 0) data.insert(data.end(), tmp, tmp + n);
+    std::fclose(f);
+    if (data.empty()) return;
+    const size_t sz = data.size();
+    {
+        std::lock_guard<std::mutex> lk(g_ovMu);
+        Ov o;
+        o.data = std::move(data);
+        g_ov[asset] = std::move(o);
+    }
+    g_ovCount.fetch_add(1, std::memory_order_relaxed);
+    static int s_ovLog = 0;
+    if (s_ovLog < 20) { ++s_ovLog; logLine("MatOverride: serving %.60s from override (%lld bytes)", fname.c_str(), static_cast<long long>(sz)); }
+}
+
+bool readName(const char* name, char* out, size_t cap) {
+    static const size_t tries[] = {120, 64, 32, 16};
+    for (size_t t : tries) {
+        if (t >= cap) continue;
+        if (safeRead(name, out, t)) { out[t] = 0; out[cap - 1] = 0; return true; }
+    }
+    return false;
+}
+
+void* assetOpenDetour(void* mgr, const char* name, int mode) {
+    void* a = g_assetOrig ? g_assetOrig(mgr, name, mode) : nullptr;
+    if (!a || !name) return a;
+    if (!g_assetOn.load(std::memory_order_relaxed) && !g_dumpOn.load(std::memory_order_relaxed) &&
+        !g_ovOn.load(std::memory_order_relaxed))
+        return a;
+    char buf[200] = {0};
+    if (!readName(name, buf, sizeof(buf))) return a;
+    if (!std::strstr(buf, "material") && !std::strstr(buf, "renderer")) return a;
+
+    if (g_assetOn.load(std::memory_order_relaxed)) {
+        const int n = g_assetLines.fetch_add(1, std::memory_order_relaxed);
+        if (n < 250) logLine("AssetProbe: open \"%.150s\" mode=%d", buf, mode);
+    }
+    if (std::strstr(buf, ".material.bin")) {
+        const char* slash = std::strrchr(buf, '/');
+        const std::string fname = slash ? slash + 1 : buf;
+        if (g_dumpOn.load(std::memory_order_relaxed) && wantDump(fname)) maybeDump(a, fname);
+        if (g_ovOn.load(std::memory_order_relaxed) && g_ovHooked) maybeOverride(a, fname);
+    }
+    return a;
 }
 
 bool installAssetHook() {
@@ -107,12 +364,14 @@ bool installAssetHook() {
     void* h = dlopen("libandroid.so", RTLD_NOW);
     void* fn = h ? dlsym(h, "AAssetManager_open") : nullptr;
     if (!fn) { logLine("AssetProbe: AAssetManager_open not found"); return false; }
+    f_getLength64 = reinterpret_cast<int64_t (*)(void*)>(dlsym(h, "AAsset_getLength64"));
+    f_getBuffer = reinterpret_cast<const void* (*)(void*)>(dlsym(h, "AAsset_getBuffer"));
     void* orig = nullptr;
     if (pl::memory::hook(fn, reinterpret_cast<void*>(&assetOpenDetour), &orig) != 0 || !orig) {
         logLine("AssetProbe: hook FAIL");
         return false;
     }
-    g_assetOrig = reinterpret_cast<void* (*)(void*, const char*, int)>(orig);
+    g_assetOrig = reinterpret_cast<OpenFn>(orig);
     g_assetHooked = true;
     logLine("AssetProbe: AAssetManager_open hooked (pass-through)");
     return true;
@@ -194,7 +453,25 @@ void setAssetProbe(bool on) {
     if (bactro::phase::safeMode.load(std::memory_order_acquire)) { logLine("AssetProbe: skipped (SAFE MODE)"); return; }
     if (on && !installAssetHook()) return;
     g_assetOn.store(on, std::memory_order_relaxed);
-    logLine(on ? "AssetProbe ON - open a world, wait a few seconds, then turn it off" : "AssetProbe OFF");
+    logLine(on ? "AssetProbe ON - leave and re-join the world, then turn it off" : "AssetProbe OFF");
+}
+
+void setMaterialDump(bool on) {
+    if (bactro::phase::safeMode.load(std::memory_order_acquire)) { logLine("MatDump: skipped (SAFE MODE)"); return; }
+    if (on && !installAssetHook()) return;
+    g_dumpOn.store(on, std::memory_order_relaxed);
+    logLine(on ? "MatDump ON - leave and re-join the world; files go to bactro_materials/dump" : "MatDump OFF");
+}
+
+void setMaterialOverride(bool on) {
+    if (bactro::phase::safeMode.load(std::memory_order_acquire)) { logLine("MatOverride: skipped (SAFE MODE)"); return; }
+    if (on) {
+        bactro::guard::noteRiskyHookRan();
+        if (!installAssetHook() || !installOverrideHooks()) return;
+        ensureDirs();
+    }
+    g_ovOn.store(on, std::memory_order_relaxed);
+    logLine(on ? "MatOverride ON - serving bactro_materials/override/*.material.bin on next load" : "MatOverride OFF");
 }
 
 void setPathProbe(bool on) {

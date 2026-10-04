@@ -783,8 +783,10 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
         }
         else if (key == "assetProbe")
             bactro::material::setAssetProbe(value == "true" || value == "1");
-        else if (key == "pathProbe")
-            bactro::material::setPathProbe(value == "true" || value == "1");
+        else if (key == "matDump")
+            bactro::material::setMaterialDump(value == "true" || value == "1");
+        else if (key == "matOverride")
+            bactro::material::setMaterialOverride(value == "true" || value == "1");
         else if (key == "targetActors")
             g_targetActors.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "targetHand")
@@ -822,7 +824,8 @@ void registerModule() {
     b.config("targetActors", "All actors (players, mobs, menu dummy)", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetHand", "Hand / items / cosmetics", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("assetProbe", "Asset probe: log material files (debug)", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
-    b.config("pathProbe", "Path probe: MaterialBinPathBuilder (debug)", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("matDump", "Material dump: save original Actor.material.bin", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("matOverride", "Material override: use my material.bin files", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("probe", "Thread probe (debug)", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
 
     b.registerModule();
