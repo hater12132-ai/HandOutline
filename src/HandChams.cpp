@@ -1,6 +1,7 @@
 #include "bactro/HandChams.hpp"
 #include "bactro/RenderPhase.hpp"
 #include "bactro/Guard.hpp"
+#include "bactro/MaterialProbe.hpp"
 #include "bactro/Signatures.hpp"
 #include "bactro/Status.hpp"
 
@@ -47,8 +48,8 @@ std::atomic<float> g_outlineGlow{0.6f};    // extra glow passes (0=off, 1=strong
 std::atomic<float> g_outlineAlpha{0.95f};  // line alpha
 std::atomic_bool g_playersOnly{true};
 std::atomic<float> g_r{1.00f};
-std::atomic<float> g_g{1.00f};
-std::atomic<float> g_b{1.00f};
+std::atomic<float> g_g{0.10f};
+std::atomic<float> g_b{0.10f};
 std::atomic<float> g_opacity{0.85f};
 
 Color g_chams{1.f, 1.f, 1.f, 0.85f};
@@ -586,12 +587,13 @@ void setEntityConstantsDetour(void* entityConstants, void* renderContext, const 
     static Color s_white{};
     s_fill = g_chams;
     if (s_fill.a < 0.85f) s_fill.a = 0.85f;
-    s_edge = {1.f, 1.f, 1.f, 1.f};
-    s_white = {1.f, 1.f, 1.f, 1.f};
+    s_edge = g_chams;
+    s_edge.a = 1.f;
+    s_white = s_edge;
     const Color* tile = &s_fill;
     static int s_app = 0;
     if (s_app < 16) {
-        logLine("HandChams: CONST APPLY #%d fp=%d sticky=%d (forced white edge)", s_app, fp ? 1 : 0, sticky);
+        logLine("HandChams: CONST APPLY #%d fp=%d sticky=%d (edge = chosen color)", s_app, fp ? 1 : 0, sticky);
         ++s_app;
     }
     // overlay/changeColor/glint all forced — max chance RD shows hand tint
@@ -629,13 +631,9 @@ void setupActorGlintDetour(GEN_DECL) {
             static Color s_fill{};
             static Color s_edge{};
             s_fill = g_chams;
-            if (handWin || !actor) {
-                s_edge = {1.f, 1.f, 1.f, 1.f};
-                if (s_fill.a < 0.75f) s_fill.a = 0.75f;
-            } else {
-                s_edge = g_outline;
-                s_edge.a = 1.f;
-            }
+            s_edge = g_chams;
+            s_edge.a = 1.f;
+            if ((handWin || !actor) && s_fill.a < 0.75f) s_fill.a = 0.75f;
             static int s_gapp = 0;
             if (s_gapp < 12) {
                 logLine("HandChams: GLINT APPLY #%d actor=%p", s_gapp, actor);
@@ -658,7 +656,8 @@ void setupGlintDetour(GEN_DECL) {
         static Color fill{}, edge{};
         fill = g_chams;
         if (fill.a < 0.85f) fill.a = 0.85f;
-        edge = {1.f, 1.f, 1.f, 1.f};
+        edge = g_chams;
+        edge.a = 1.f;
         g_setupGlint(x0, x1, x2, &fill, &fill, &fill, &edge, x7, GEN_TAIL);
         return;
     }
@@ -782,6 +781,10 @@ void onConfig(std::string_view, std::string_view key, std::string_view value) {
             }
             logLine(on ? "Probe ON (join a world with players/mobs nearby, wait ~30s)" : "Probe OFF");
         }
+        else if (key == "assetProbe")
+            bactro::material::setAssetProbe(value == "true" || value == "1");
+        else if (key == "pathProbe")
+            bactro::material::setPathProbe(value == "true" || value == "1");
         else if (key == "targetActors")
             g_targetActors.store(value == "true" || value == "1", std::memory_order_relaxed);
         else if (key == "targetHand")
@@ -813,11 +816,13 @@ void registerModule() {
         .onToggle(onToggle)
         .onConfigChanged(onConfig);
     b.config("r", "Red", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
-    b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
-    b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "1.00", "0", "1", "");
+    b.config("g", "Green", pl::modmenu::ConfigType::SliderFloat, "0.10", "0", "1", "");
+    b.config("b", "Blue", pl::modmenu::ConfigType::SliderFloat, "0.10", "0", "1", "");
     b.config("opacity", "Opacity", pl::modmenu::ConfigType::SliderFloat, "0.85", "0.05", "1.0", "");
     b.config("targetActors", "All actors (players, mobs, menu dummy)", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
     b.config("targetHand", "Hand / items / cosmetics", pl::modmenu::ConfigType::Toggle, "true", "", "", "");
+    b.config("assetProbe", "Asset probe: log material files (debug)", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
+    b.config("pathProbe", "Path probe: MaterialBinPathBuilder (debug)", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
     b.config("probe", "Thread probe (debug)", pl::modmenu::ConfigType::Toggle, "false", "", "", "");
 
     b.registerModule();
